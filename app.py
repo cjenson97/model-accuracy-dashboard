@@ -689,6 +689,7 @@ with tab4:
                     "Unscored Rate %",
                     "Overall Agreement %", "Accuracy 3s %", "Accuracy 2s %", "Accuracy 1s %",
                 ] if c in df_all_active.columns]
+                
 
                 st.dataframe(
                     df_all_active[all_cols].style.format(fmt, na_rep="-"),
