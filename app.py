@@ -1,21 +1,22 @@
 import streamlit as st
 import pandas as pd
 from pyathena import connect
+from pyathena.pandas.cursor import PandasCursor
 
-# Pull credentials from Streamlit secrets
-conn = connect(
-    aws_access_key_id=st.secrets["aws"]["AWS_ACCESS_KEY_ID"],
-    aws_secret_access_key=st.secrets["aws"]["AWS_SECRET_ACCESS_KEY"],
-    s3_staging_dir="s3://YOUR-RESULTS-BUCKET/athena-results/",  # <-- update this
-    region_name="eu-west-2",
-    work_group="primary",
-)
+def get_cursor():
+    return connect(
+        aws_access_key_id=st.secrets["aws"]["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=st.secrets["aws"]["AWS_SECRET_ACCESS_KEY"],
+        s3_staging_dir=st.secrets["aws"]["S3_STAGING_DIR"],
+        region_name="eu-west-2",
+        work_group="primary",
+        cursor_class=PandasCursor,
+    ).cursor()
 
-st.title("Feedback Loop Dashboard")
-
-@st.cache_data(ttl=600)  # Cache for 10 minutes for "live-ish" data
+@st.cache_data(ttl=600)
 def load_data():
-    query = """
+    cursor = get_cursor()
+    return cursor.execute("""
         SELECT 
             content_id,
             ai_meta_id,
@@ -27,10 +28,21 @@ def load_data():
         FROM scans.feedback_loop_prod
         ORDER BY score_updated_date DESC
         LIMIT 1000
-    """
-    return pd.read_sql(query, conn)
+    """).as_pandas()
 
-df = load_data()
+st.title("Feedback Loop Dashboard")
 
-st.dataframe(df)
-st.bar_chart(df["ai_score"])  # Example chart — customise as needed
+try:
+    df = load_data()
+    st.dataframe(df)
+except Exception as e:
+    st.error(f"Error: {e}")
+    st.stop()
+```
+
+And your `requirements.txt`:
+```
+streamlit
+pyathena[pandas]
+boto3
+pandas
