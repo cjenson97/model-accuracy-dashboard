@@ -1,4 +1,6 @@
 streamlit
+pyathena[pandas]
 boto3
-pyathena
 pandas
+gspread
+google-auth
