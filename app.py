@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from pyathena import connect
 
 # ──────────────────────────────────────────
-# CONFIG
+# PAGE CONFIG
 # ──────────────────────────────────────────
 st.set_page_config(
     page_title="Model Accuracy Dashboard",
@@ -13,39 +13,46 @@ st.set_page_config(
     page_icon="📊"
 )
 
-ATHENA_S3_STAGING = st.secrets["athena"]["s3_staging_dir"]
-ATHENA_REGION     = st.secrets["athena"]["region"]
-ATHENA_DATABASE   = st.secrets["athena"]["database"]
-
-# Benchmarks (update these or wire to Sheets later)
-BENCHMARK_3S = 85.0  # % target for 3s accuracy
-BENCHMARK_1S = 90.0  # % target for 1s accuracy
-
-
 # ──────────────────────────────────────────
-# DATA LAYER
+# ATHENA CONNECTION
+# Pull credentials from Streamlit secrets
 # ──────────────────────────────────────────
 @st.cache_resource
 def get_connection():
     return connect(
-        s3_staging_dir=ATHENA_S3_STAGING,
-        region_name=ATHENA_REGION,
-        schema_name=ATHENA_DATABASE
+        s3_staging_dir=st.secrets["athena"]["s3_staging_dir"],
+        region_name=st.secrets["athena"]["region"],
+        schema_name=st.secrets["athena"]["database"],
+        aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
     )
+
+# ──────────────────────────────────────────
+# DATA QUERIES
+# scored_updates columns:
+#   raw_content_id, content_id, document_title,
+#   document, jurisdiction, authority, vertical, score, score_reason
+#
+# feedback_loop_prod columns:
+#   content_id, ai_meta_id, score_updated_date,
+#   created_date, document_name, jurisdiction,
+#   document, ai_score, ai_score_reason, analyst
+# ──────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
 def load_scored_updates():
     query = """
         SELECT
-            week,
-            industry,
-            analyst,
+            raw_content_id,
+            content_id,
+            document_title,
             jurisdiction,
+            authority,
+            vertical,
             score,
-            COUNT(*) AS total_updates,
-            SUM(CASE WHEN accepted = true THEN 1 ELSE 0 END) AS accepted_updates
+            score_reason
         FROM scored_updates
-        GROUP BY week, industry, analyst, jurisdiction, score
+        WHERE score IS NOT NULL
     """
     return pd.read_sql(query, get_connection())
 
@@ -53,146 +60,210 @@ def load_scored_updates():
 def load_feedback_loop():
     query = """
         SELECT
-            week,
-            industry,
-            analyst,
+            content_id,
+            ai_meta_id,
+            score_updated_date,
+            created_date,
+            document_name,
             jurisdiction,
-            published_count
+            ai_score,
+            ai_score_reason,
+            analyst
         FROM feedback_loop_prod
+        WHERE ai_score IS NOT NULL
     """
     return pd.read_sql(query, get_connection())
 
 
 # ──────────────────────────────────────────
-# COMPUTED METRICS
+# LOAD DATA
 # ──────────────────────────────────────────
-def compute_accuracy(df):
-    """
-    For score 3s: accuracy = accepted_3s / total_3s * 100
-    For score 1s: accuracy = (total_1s - accepted_1s) / total_1s * 100
-    """
-    score3 = df[df["score"] == 3].groupby(["week", "industry"]).agg(
-        total_3s=("total_updates", "sum"),
-        accepted_3s=("accepted_updates", "sum")
-    ).reset_index()
-    score3["accuracy_3s"] = (score3["accepted_3s"] / score3["total_3s"] * 100).round(1)
+with st.spinner("Loading data from Athena..."):
+    scored_df = load_scored_updates()
+    feedback_df = load_feedback_loop()
 
-    score1 = df[df["score"] == 1].groupby(["week", "industry"]).agg(
-        total_1s=("total_updates", "sum"),
-        accepted_1s=("accepted_updates", "sum")
-    ).reset_index()
-    score1["accuracy_1s"] = (
-        (score1["total_1s"] - score1["accepted_1s"]) / score1["total_1s"] * 100
-    ).round(1)
-
-    return score3.merge(score1, on=["week", "industry"], how="outer")
-
-def compute_pending_review(df):
-    return df[df["score"].isin([2, 3])].groupby(["week", "industry"]).agg(
-        pending=("total_updates", "sum")
-    ).reset_index()
+# Convert dates
+feedback_df["score_updated_date"] = pd.to_datetime(
+    feedback_df["score_updated_date"], errors="coerce"
+)
+feedback_df["created_date"] = pd.to_datetime(
+    feedback_df["created_date"], errors="coerce"
+)
+feedback_df["week"] = feedback_df["score_updated_date"].dt.to_period("W").astype(str)
 
 
 # ──────────────────────────────────────────
 # SIDEBAR FILTERS
 # ──────────────────────────────────────────
-st.sidebar.title("Filters")
+st.sidebar.title("🔍 Filters")
 
-raw_df    = load_scored_updates()
-fl_df     = load_feedback_loop()
+all_jurisdictions = sorted(scored_df["jurisdiction"].dropna().unique())
+all_verticals     = sorted(scored_df["vertical"].dropna().unique())
+all_analysts      = sorted(feedback_df["analyst"].dropna().unique())
 
-all_weeks      = sorted(raw_df["week"].unique(), reverse=True)
-all_industries = sorted(raw_df["industry"].unique())
-all_analysts   = sorted(raw_df["analyst"].unique())
-
-selected_weeks = st.sidebar.select_slider(
-    "Week range",
-    options=all_weeks,
-    value=(all_weeks[-1], all_weeks[0])
+selected_jurisdictions = st.sidebar.multiselect(
+    "Jurisdiction", all_jurisdictions, default=all_jurisdictions
 )
-selected_industries = st.sidebar.multiselect(
-    "Industries", all_industries, default=all_industries
+selected_verticals = st.sidebar.multiselect(
+    "Vertical / Industry", all_verticals, default=all_verticals
 )
 selected_analysts = st.sidebar.multiselect(
-    "Analysts", all_analysts, default=all_analysts
+    "Analyst", all_analysts, default=all_analysts
 )
 
 # Apply filters
-mask = (
-    raw_df["week"].between(*selected_weeks) &
-    raw_df["industry"].isin(selected_industries) &
-    raw_df["analyst"].isin(selected_analysts)
-)
-filtered_df = raw_df[mask]
-filtered_fl = fl_df[
-    fl_df["week"].between(*selected_weeks) &
-    fl_df["industry"].isin(selected_industries) &
-    fl_df["analyst"].isin(selected_analysts)
+scored_filtered = scored_df[
+    scored_df["jurisdiction"].isin(selected_jurisdictions) &
+    scored_df["vertical"].isin(selected_verticals)
+]
+feedback_filtered = feedback_df[
+    feedback_df["jurisdiction"].isin(selected_jurisdictions) &
+    feedback_df["analyst"].isin(selected_analysts)
 ]
 
 
 # ──────────────────────────────────────────
-# MAIN LAYOUT
+# BENCHMARKS
+# Update these numbers to match your targets
+# ──────────────────────────────────────────
+BENCHMARK_3S = 85.0
+BENCHMARK_1S = 90.0
+
+
+# ──────────────────────────────────────────
+# COMPUTED METRICS
+# ──────────────────────────────────────────
+
+# Score distribution from scored_updates
+score_counts = scored_filtered.groupby(
+    ["vertical", "score"]
+)["content_id"].count().reset_index()
+score_counts.columns = ["vertical", "score", "count"]
+
+# Accuracy per vertical from feedback_loop
+# 3s accuracy = ai_score==3 accepted (analyst==1) / total ai_score==3
+# 1s accuracy = ai_score==1 NOT accepted / total ai_score==1
+score3 = feedback_filtered[feedback_filtered["ai_score"] == 3].groupby("jurisdiction").agg(
+    total_3s=("content_id", "count"),
+    accepted_3s=("analyst", lambda x: (x == 1).sum())
+).reset_index()
+score3["accuracy_3s"] = (score3["accepted_3s"] / score3["total_3s"] * 100).round(1)
+
+score1 = feedback_filtered[feedback_filtered["ai_score"] == 1].groupby("jurisdiction").agg(
+    total_1s=("content_id", "count"),
+    accepted_1s=("analyst", lambda x: (x == 1).sum())
+).reset_index()
+score1["accuracy_1s"] = (
+    (score1["total_1s"] - score1["accepted_1s"]) / score1["total_1s"] * 100
+).round(1)
+
+accuracy_df = score3.merge(score1, on="jurisdiction", how="outer")
+
+# Weekly trend
+weekly = feedback_filtered.groupby(["week", "ai_score"])["content_id"].count().reset_index()
+weekly.columns = ["week", "ai_score", "count"]
+
+# Pending review (score 2 and 3 not yet reviewed — analyst is null)
+pending = scored_filtered[
+    scored_filtered["score"].isin([2, 3])
+]["content_id"].count()
+
+# Analyst breakdown
+analyst_breakdown = feedback_filtered.groupby(
+    ["analyst", "ai_score"]
+)["content_id"].count().reset_index()
+analyst_breakdown.columns = ["analyst", "ai_score", "count"]
+
+
+# ──────────────────────────────────────────
+# DASHBOARD LAYOUT
 # ──────────────────────────────────────────
 st.title("📊 Model Accuracy Dashboard")
-
-accuracy_df = compute_accuracy(filtered_df)
-pending_df  = compute_pending_review(filtered_df)
+st.caption("Data sourced from `scored_updates` and `feedback_loop_prod` via Amazon Athena")
 
 # ── KPI ROW ──────────────────────────────
-latest_week = accuracy_df["week"].max()
-latest      = accuracy_df[accuracy_df["week"] == latest_week]
-
-avg_3s  = latest["accuracy_3s"].mean()
-avg_1s  = latest["accuracy_1s"].mean()
-total_u = filtered_df[filtered_df["week"] == latest_week]["total_updates"].sum()
-pending = pending_df[pending_df["week"] == latest_week]["pending"].sum()
+avg_3s  = accuracy_df["accuracy_3s"].mean()
+avg_1s  = accuracy_df["accuracy_1s"].mean()
+total_u = len(scored_filtered)
 
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Avg 3s Accuracy (latest week)", f"{avg_3s:.1f}%",
-          delta=f"Benchmark: {BENCHMARK_3S}%",
-          delta_color="normal" if avg_3s >= BENCHMARK_3S else "inverse")
-k2.metric("Avg 1s Accuracy (latest week)", f"{avg_1s:.1f}%",
-          delta=f"Benchmark: {BENCHMARK_1S}%",
-          delta_color="normal" if avg_1s >= BENCHMARK_1S else "inverse")
-k3.metric("Total Updates (latest week)", f"{int(total_u):,}")
-k4.metric("Pending Review (3s + 2s)", f"{int(pending):,}")
+k1.metric(
+    "Avg 3s Accuracy",
+    f"{avg_3s:.1f}%" if not pd.isna(avg_3s) else "N/A",
+    delta=f"{avg_3s - BENCHMARK_3S:+.1f}% vs benchmark" if not pd.isna(avg_3s) else None,
+    delta_color="normal" if not pd.isna(avg_3s) and avg_3s >= BENCHMARK_3S else "inverse"
+)
+k2.metric(
+    "Avg 1s Accuracy",
+    f"{avg_1s:.1f}%" if not pd.isna(avg_1s) else "N/A",
+    delta=f"{avg_1s - BENCHMARK_1S:+.1f}% vs benchmark" if not pd.isna(avg_1s) else None,
+    delta_color="normal" if not pd.isna(avg_1s) and avg_1s >= BENCHMARK_1S else "inverse"
+)
+k3.metric("Total Updates Scored", f"{total_u:,}")
+k4.metric("Pending Review (Score 2s & 3s)", f"{pending:,}")
 
 st.divider()
 
 
-# ── WEEKLY ACCURACY TRENDS ────────────────
-st.subheader("Weekly Model Accuracy by Industry")
+# ── SCORE DISTRIBUTION BY VERTICAL ───────
+st.subheader("Score Distribution by Vertical / Industry")
+fig = px.bar(
+    score_counts, x="vertical", y="count", color="score",
+    barmode="stack",
+    color_discrete_map={1: "#ef4444", 2: "#f59e0b", 3: "#22c55e"},
+    labels={"count": "Number of Updates", "vertical": "Vertical", "score": "Score"}
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+
+# ── ACCURACY VS BENCHMARK ─────────────────
+st.subheader("Accuracy vs Benchmarks by Jurisdiction")
 tab1, tab2 = st.tabs(["Score 3s Accuracy", "Score 1s Accuracy"])
 
 with tab1:
-    fig = px.line(
-        accuracy_df, x="week", y="accuracy_3s", color="industry",
-        markers=True, labels={"accuracy_3s": "Accuracy (%)", "week": "Week"}
-    )
-    fig.add_hline(y=BENCHMARK_3S, line_dash="dash", line_color="red",
-                  annotation_text=f"Benchmark {BENCHMARK_3S}%")
-    st.plotly_chart(fig, use_container_width=True)
+    if not accuracy_df.empty:
+        fig = px.bar(
+            accuracy_df.sort_values("accuracy_3s", ascending=False),
+            x="jurisdiction", y="accuracy_3s",
+            color="accuracy_3s",
+            color_continuous_scale=["#ef4444", "#f59e0b", "#22c55e"],
+            labels={"accuracy_3s": "Accuracy (%)", "jurisdiction": "Jurisdiction"},
+            range_color=[50, 100]
+        )
+        fig.add_hline(
+            y=BENCHMARK_3S, line_dash="dash", line_color="red",
+            annotation_text=f"Benchmark {BENCHMARK_3S}%"
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
-    fig = px.line(
-        accuracy_df, x="week", y="accuracy_1s", color="industry",
-        markers=True, labels={"accuracy_1s": "Accuracy (%)", "week": "Week"}
-    )
-    fig.add_hline(y=BENCHMARK_1S, line_dash="dash", line_color="red",
-                  annotation_text=f"Benchmark {BENCHMARK_1S}%")
-    st.plotly_chart(fig, use_container_width=True)
+    if not accuracy_df.empty:
+        fig = px.bar(
+            accuracy_df.sort_values("accuracy_1s", ascending=False),
+            x="jurisdiction", y="accuracy_1s",
+            color="accuracy_1s",
+            color_continuous_scale=["#ef4444", "#f59e0b", "#22c55e"],
+            labels={"accuracy_1s": "Accuracy (%)", "jurisdiction": "Jurisdiction"},
+            range_color=[50, 100]
+        )
+        fig.add_hline(
+            y=BENCHMARK_1S, line_dash="dash", line_color="red",
+            annotation_text=f"Benchmark {BENCHMARK_1S}%"
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
 
-# ── SCORE DISTRIBUTION ────────────────────
-st.subheader("Score Distribution by Industry")
-score_dist = filtered_df.groupby(["industry", "score"])["total_updates"].sum().reset_index()
-fig = px.bar(
-    score_dist, x="industry", y="total_updates", color="score",
-    barmode="stack", labels={"total_updates": "Updates", "score": "Score"},
-    color_discrete_map={1: "#ef4444", 2: "#f59e0b", 3: "#22c55e"}
+# ── WEEKLY TREND ──────────────────────────
+st.subheader("Weekly Volume by Score")
+fig = px.line(
+    weekly, x="week", y="count", color="ai_score",
+    markers=True,
+    color_discrete_map={1: "#ef4444", 2: "#f59e0b", 3: "#22c55e"},
+    labels={"count": "Number of Updates", "week": "Week", "ai_score": "Score"}
 )
 st.plotly_chart(fig, use_container_width=True)
 
@@ -200,66 +271,68 @@ st.divider()
 
 
 # ── BENCHMARK COMPARISON TABLE ────────────
-st.subheader("Performance vs Benchmarks")
+st.subheader("Full Accuracy Table")
+if not accuracy_df.empty:
+    display_df = accuracy_df.copy()
+    display_df["3s vs Benchmark"] = display_df["accuracy_3s"] - BENCHMARK_3S
+    display_df["1s vs Benchmark"] = display_df["accuracy_1s"] - BENCHMARK_1S
 
-bm_table = accuracy_df[accuracy_df["week"] == latest_week][
-    ["industry", "accuracy_3s", "accuracy_1s"]
-].copy()
-bm_table["3s vs Benchmark"] = bm_table["accuracy_3s"] - BENCHMARK_3S
-bm_table["1s vs Benchmark"] = bm_table["accuracy_1s"] - BENCHMARK_1S
+    def colour_delta(val):
+        if pd.isna(val):
+            return ""
+        return "color: green" if val >= 0 else "color: red"
 
-def colour_delta(val):
-    colour = "green" if val >= 0 else "red"
-    return f"color: {colour}"
-
-st.dataframe(
-    bm_table.style
-        .applymap(colour_delta, subset=["3s vs Benchmark", "1s vs Benchmark"])
-        .format({
-            "accuracy_3s": "{:.1f}%",
-            "accuracy_1s": "{:.1f}%",
-            "3s vs Benchmark": "{:+.1f}%",
-            "1s vs Benchmark": "{:+.1f}%"
-        }),
-    use_container_width=True
-)
+    st.dataframe(
+        display_df[[
+            "jurisdiction", "total_3s", "accepted_3s", "accuracy_3s",
+            "total_1s", "accepted_1s", "accuracy_1s",
+            "3s vs Benchmark", "1s vs Benchmark"
+        ]].style
+            .applymap(colour_delta, subset=["3s vs Benchmark", "1s vs Benchmark"])
+            .format({
+                "accuracy_3s": "{:.1f}%",
+                "accuracy_1s": "{:.1f}%",
+                "3s vs Benchmark": "{:+.1f}%",
+                "1s vs Benchmark": "{:+.1f}%"
+            }, na_rep="N/A"),
+        use_container_width=True
+    )
 
 st.divider()
 
 
-# ── ANALYST DRILLDOWN ─────────────────────
-st.subheader("Analyst-Level Breakdown")
-
-analyst_scores = filtered_df.groupby(["analyst", "score"])["total_updates"].sum().reset_index()
-analyst_pub    = filtered_fl.groupby("analyst")["published_count"].sum().reset_index()
-
+# ── ANALYST BREAKDOWN ─────────────────────
+st.subheader("Analyst Breakdown")
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("**Updates received by score**")
+    st.markdown("**Updates by analyst and score**")
     fig = px.bar(
-        analyst_scores, x="analyst", y="total_updates", color="score",
-        barmode="stack", labels={"total_updates": "Updates"},
-        color_discrete_map={1: "#ef4444", 2: "#f59e0b", 3: "#22c55e"}
+        analyst_breakdown, x="analyst", y="count", color="ai_score",
+        barmode="stack",
+        color_discrete_map={1: "#ef4444", 2: "#f59e0b", 3: "#22c55e"},
+        labels={"count": "Updates", "analyst": "Analyst", "ai_score": "Score"}
     )
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
-    st.markdown("**Updates published**")
-    fig = px.bar(
-        analyst_pub, x="analyst", y="published_count",
-        labels={"published_count": "Published Updates"},
-        color_discrete_sequence=["#6366f1"]
+    st.markdown("**Score reason breakdown**")
+    reason_counts = feedback_filtered["ai_score_reason"].value_counts().reset_index()
+    reason_counts.columns = ["reason", "count"]
+    fig = px.pie(
+        reason_counts, names="reason", values="count",
+        hole=0.4
     )
     st.plotly_chart(fig, use_container_width=True)
 
+
+# ── RAW DATA EXPLORER ─────────────────────
 st.divider()
+st.subheader("🔎 Raw Data Explorer")
+explore_tab1, explore_tab2 = st.tabs(["scored_updates", "feedback_loop_prod"])
 
+with explore_tab1:
+    st.dataframe(scored_filtered, use_container_width=True)
 
-# ── PENDING REVIEW ────────────────────────
-st.subheader("Pending Review Queue (Score 3s & 2s)")
-fig = px.bar(
-    pending_df, x="week", y="pending", color="industry",
-    barmode="stack", labels={"pending": "Updates Pending Review"}
-)
-st.plotly_chart(fig, use_container_width=True)
+with explore_tab2:
+    st.dataframe(feedback_filtered, use_container_width=True)
