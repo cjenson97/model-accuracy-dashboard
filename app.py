@@ -17,7 +17,7 @@ def get_cursor():
 def load_data():
     cursor = get_cursor()
     return cursor.execute("""
-        SELECT 
+        SELECT
             content_id,
             ai_meta_id,
             score_updated_date,
@@ -38,11 +38,3 @@ try:
 except Exception as e:
     st.error(f"Error: {e}")
     st.stop()
-```
-
-And your `requirements.txt`:
-```
-streamlit
-pyathena[pandas]
-boto3
-pandas
