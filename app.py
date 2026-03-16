@@ -421,8 +421,8 @@ with tab1:
         )
         styled = (
             summary.style
-            .applymap(lambda v: colour_cell(v, BENCHMARK_3S), subset=["Accuracy 3s %"])
-            .applymap(lambda v: colour_cell(v, BENCHMARK_1S), subset=["Accuracy 1s %"])
+            .map(lambda v: colour_cell(v, BENCHMARK_3S), subset=["Accuracy 3s %"])
+            .map(lambda v: colour_cell(v, BENCHMARK_1S), subset=["Accuracy 1s %"])
             .format({"Accuracy 3s %": "{:.1f}%", "Accuracy 1s %": "{:.1f}%"}, na_rep="-")
         )
         st.dataframe(styled, use_container_width=True)
@@ -655,7 +655,7 @@ with tab4:
                 styled_prob = df_problematic[prob_cols].style.format(fmt, na_rep="-")
                 for col in acc_cols:
                     if col in prob_cols:
-                        styled_prob = styled_prob.applymap(colour_score, subset=[col])
+                        styled_prob = styled_prob.map(colour_score, subset=[col])
 
                 st.dataframe(styled_prob, use_container_width=True)
 
