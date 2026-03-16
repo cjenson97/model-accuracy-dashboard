@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 from pyathena import connect
 from pyathena.pandas.cursor import PandasCursor
 from datetime import datetime, timedelta
@@ -48,10 +50,20 @@ def load_scored_updates(year: str, month: str):
 
 @st.cache_data(ttl=3600)
 def load_master_sources():
-    """Load the Documents and URLs tab from the Master Sources Google Sheet."""
-    url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid=198188912"
+    """Load Documents and URLs tab from Master Sources via authenticated service account."""
     try:
-        df = pd.read_csv(url)
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets.readonly",
+                "https://www.googleapis.com/auth/drive.readonly",
+            ],
+        )
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SPREADSHEET_ID)
+        worksheet = sheet.worksheet("Documents and URLs")
+        data = worksheet.get_all_records()
+        df = pd.DataFrame(data)
         df.columns = df.columns.str.strip()
         return df
     except Exception as e:
@@ -79,11 +91,15 @@ def compute_summary(df):
         acc_1      = round((total_1 - accepted_1) / total_1 * 100, 1) if total_1 > 0 else None
         pending    = len(grp[(grp["ai_score"].isin([2, 3])) & (grp["analyst_score"].isna())])
         results.append({
-            "Industry": industry,
-            "Score 3": total_3, "Score 2": total_2,
-            "Score 1": total_1, "Unscored": unscored,
-            "3s Accepted": accepted_3, "1s Accepted": accepted_1,
-            "Accuracy 3s %": acc_3, "Accuracy 1s %": acc_1,
+            "Industry":       industry,
+            "Score 3":        total_3,
+            "Score 2":        total_2,
+            "Score 1":        total_1,
+            "Unscored":       unscored,
+            "3s Accepted":    accepted_3,
+            "1s Accepted":    accepted_1,
+            "Accuracy 3s %":  acc_3,
+            "Accuracy 1s %":  acc_1,
             "Pending Review": pending,
         })
     return pd.DataFrame(results)
@@ -97,89 +113,83 @@ def compute_source_accuracy(df_feedback, df_sources):
     """
     Cross-reference feedback_loop_prod with the Master Sources sheet.
     Groups feedback by jurisdiction + document_name and computes accuracy per source.
+    Returns (reliable_top10, poor_top10, full_table).
     """
     if df_feedback.empty or df_sources.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Normalise join keys
-    df_feedback = df_feedback.copy()
-    df_feedback["jurisdiction_key"] = df_feedback["jurisdiction"].str.strip().str.lower()
+    group_cols = (
+        ["jurisdiction", "document_name"]
+        if "document_name" in df_feedback.columns
+        else ["jurisdiction"]
+    )
 
-    # Compute accuracy per (jurisdiction, document_name) combination
     source_stats = []
-    group_cols = ["jurisdiction", "document_name"] if "document_name" in df_feedback.columns else ["jurisdiction"]
-
     for keys, grp in df_feedback.groupby(group_cols):
         if isinstance(keys, str):
             keys = (keys,)
 
-        total = len(grp)
         reviewed = grp["analyst_score"].notna().sum()
         if reviewed == 0:
             continue
 
-        total_3 = len(grp[grp["ai_score"] == 3])
-        total_1 = len(grp[grp["ai_score"] == 1])
+        total_3    = len(grp[grp["ai_score"] == 3])
+        total_1    = len(grp[grp["ai_score"] == 1])
         accepted_3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
         accepted_1 = len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)])
+        agreed     = len(grp[grp["ai_score"] == grp["analyst_score"]])
 
-        # Overall agreement: analyst score == ai score
-        agreed = len(grp[grp["ai_score"] == grp["analyst_score"]])
-        agreement_pct = round(agreed / reviewed * 100, 1)
-
-        acc_3 = round(accepted_3 / total_3 * 100, 1) if total_3 > 0 else None
-        acc_1 = round((total_1 - accepted_1) / total_1 * 100, 1) if total_1 > 0 else None
-
-        row = {
-            "Jurisdiction": keys[0],
-            "Document / Source": keys[1] if len(keys) > 1 else "-",
-            "Total Updates": total,
-            "Analyst Reviewed": int(reviewed),
-            "Overall Agreement %": agreement_pct,
-            "Accuracy 3s %": acc_3,
-            "Accuracy 1s %": acc_1,
-        }
-        source_stats.append(row)
+        source_stats.append({
+            "Jurisdiction":        keys[0],
+            "Document / Source":   keys[1] if len(keys) > 1 else "-",
+            "Total Updates":       len(grp),
+            "Analyst Reviewed":    int(reviewed),
+            "Overall Agreement %": round(agreed / reviewed * 100, 1),
+            "Accuracy 3s %":       round(accepted_3 / total_3 * 100, 1) if total_3 > 0 else None,
+            "Accuracy 1s %":       round((total_1 - accepted_1) / total_1 * 100, 1) if total_1 > 0 else None,
+        })
 
     if not source_stats:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    df_stats = pd.DataFrame(source_stats).sort_values("Overall Agreement %", ascending=False)
+    df_stats = pd.DataFrame(source_stats)
 
-    # Try to enrich with master source metadata (Industry, Authority, Banding)
+    # Enrich with master source metadata (Industry, Authority, Banding)
     if not df_sources.empty:
-        # Detect column names flexibly
-        jx_col = next((c for c in df_sources.columns if "jurisd" in c.lower()), None)
-        auth_col = next((c for c in df_sources.columns if "author" in c.lower()), None)
-        band_col = next((c for c in df_sources.columns if "band" in c.lower()), None)
-        ind_col = next((c for c in df_sources.columns if "industr" in c.lower()), None)
+        jx_col   = next((c for c in df_sources.columns if "jurisd"  in c.lower()), None)
+        auth_col = next((c for c in df_sources.columns if "author"  in c.lower()), None)
+        band_col = next((c for c in df_sources.columns if "band"    in c.lower()), None)
+        ind_col  = next((c for c in df_sources.columns if "industr" in c.lower()), None)
 
         if jx_col:
-            merge_cols = {jx_col: "Jurisdiction"}
-            extra_cols = {}
-            if auth_col:  extra_cols[auth_col] = "Authority"
-            if band_col:  extra_cols[band_col] = "Banding"
-            if ind_col:   extra_cols[ind_col]  = "Industry"
+            keep = [jx_col]
+            rename = {jx_col: "Jurisdiction"}
+            for col, name in [(auth_col, "Authority"), (band_col, "Banding"), (ind_col, "Industry")]:
+                if col:
+                    keep.append(col)
+                    rename[col] = name
 
-            src_slim = df_sources[[jx_col] + list(extra_cols.keys())].drop_duplicates(subset=[jx_col])
-            src_slim = src_slim.rename(columns={**merge_cols, **extra_cols})
-            src_slim["Jurisdiction"] = src_slim["Jurisdiction"].str.strip().str.lower()
-            df_stats["_jx_key"] = df_stats["Jurisdiction"].str.strip().str.lower()
-            df_stats = df_stats.merge(src_slim, left_on="_jx_key", right_on="Jurisdiction",
-                                      how="left", suffixes=("", "_src"))
-            df_stats = df_stats.drop(columns=["_jx_key", "Jurisdiction_src"], errors="ignore")
+            src_slim = (
+                df_sources[keep]
+                .drop_duplicates(subset=[jx_col])
+                .rename(columns=rename)
+            )
+            src_slim["_jx_key"] = src_slim["Jurisdiction"].astype(str).str.strip().str.lower()
+            df_stats["_jx_key"] = df_stats["Jurisdiction"].astype(str).str.strip().str.lower()
 
-    # Top 10 reliably scored = highest agreement %, min 5 reviewed
-    reliable = (df_stats[df_stats["Analyst Reviewed"] >= 5]
-                .sort_values("Overall Agreement %", ascending=False)
-                .head(10))
+            df_stats = df_stats.merge(
+                src_slim.drop(columns=["Jurisdiction"]),
+                on="_jx_key", how="left"
+            ).drop(columns=["_jx_key"])
 
-    # Top 10 poorly scored = lowest agreement %, min 5 reviewed
-    poor = (df_stats[df_stats["Analyst Reviewed"] >= 5]
-            .sort_values("Overall Agreement %", ascending=True)
-            .head(10))
+    # Filter to sources with at least 5 reviewed updates
+    df_enough = df_stats[df_stats["Analyst Reviewed"] >= 5].copy()
 
-    return reliable, poor
+    reliable = df_enough.sort_values("Overall Agreement %", ascending=False).head(10)
+    poor     = df_enough.sort_values("Overall Agreement %", ascending=True).head(10)
+    full     = df_enough.sort_values("Overall Agreement %", ascending=False)
+
+    return reliable, poor, full
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("📊 Model Accuracy Dashboard")
@@ -192,7 +202,7 @@ st.markdown(
 st.subheader("🗓 Select Time Period")
 st.caption(
     "Choose a year and month to load data. Optionally filter down to a specific week. "
-    "Data is loaded fresh every 10 minutes."
+    "Data refreshes every 10 minutes."
 )
 
 period_col, year_col, month_col, week_col = st.columns(4)
@@ -244,9 +254,9 @@ with st.spinner("Loading Master Sources sheet..."):
     df_sources = load_master_sources()
 
 if week_option != "All weeks":
-    week_idx   = weeks.index(week_option)
-    week_start = first_day + timedelta(weeks=week_idx)
-    week_end   = min(week_start + timedelta(days=6), last_day)
+    week_idx    = weeks.index(week_option)
+    week_start  = first_day + timedelta(weeks=week_idx)
+    week_end    = min(week_start + timedelta(days=6), last_day)
     df_feedback = filter_by_week(df_feedback, "score_updated_date", week_start, week_end)
     df_scored   = filter_by_week(df_scored,   "processed_time",     week_start, week_end)
 
@@ -300,6 +310,7 @@ with tab1:
 
         st.divider()
         col_a, col_b = st.columns(2)
+
         with col_a:
             st.markdown("##### 📦 Score Distribution by Industry")
             st.caption(
@@ -307,7 +318,9 @@ with tab1:
                 "Score 3 = high relevance, Score 2 = medium, Score 1 = low relevance, "
                 "Unscored = model returned no score."
             )
-            st.bar_chart(summary.set_index("Industry")[["Score 3","Score 2","Score 1","Unscored"]])
+            st.bar_chart(
+                summary.set_index("Industry")[["Score 3","Score 2","Score 1","Unscored"]]
+            )
 
         with col_b:
             st.markdown("##### 🎯 Model Accuracy % by Industry")
@@ -316,7 +329,10 @@ with tab1:
                 f"Benchmarks: 3s = {BENCHMARK_3S}%, 1s = {BENCHMARK_1S}%. "
                 "Industries below benchmark need closer attention."
             )
-            acc = summary.set_index("Industry")[["Accuracy 3s %","Accuracy 1s %"]].dropna(how="all")
+            acc = (
+                summary.set_index("Industry")[["Accuracy 3s %","Accuracy 1s %"]]
+                .dropna(how="all")
+            )
             st.bar_chart(acc)
 
         st.divider()
@@ -354,7 +370,8 @@ with tab2:
             a3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
             a1 = len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)])
             weekly.append({
-                "Week": week, "Industry": ind,
+                "Week":          week,
+                "Industry":      ind,
                 "Accuracy 3s %": round(a3/t3*100, 1) if t3 > 0 else None,
                 "Accuracy 1s %": round((t1-a1)/t1*100, 1) if t1 > 0 else None,
             })
@@ -369,7 +386,7 @@ with tab2:
 
             col_a, col_b = st.columns(2)
             with col_a:
-                st.markdown(f"##### 📈 Score 3 Accuracy % per Week")
+                st.markdown("##### 📈 Score 3 Accuracy % per Week")
                 st.caption(
                     f"Each line = one industry over time. "
                     f"Benchmark line = {BENCHMARK_3S}%. "
@@ -380,7 +397,7 @@ with tab2:
                 st.line_chart(p3)
 
             with col_b:
-                st.markdown(f"##### 📉 Score 1 Accuracy % per Week")
+                st.markdown("##### 📉 Score 1 Accuracy % per Week")
                 st.caption(
                     f"Each line = one industry over time. "
                     f"Benchmark line = {BENCHMARK_1S}%. "
@@ -404,6 +421,7 @@ with tab3:
         st.warning("No scored_updates data for the selected period.")
     else:
         col_a, col_b = st.columns(2)
+
         with col_a:
             st.markdown("##### 📊 Score Distribution")
             st.caption(
@@ -443,9 +461,9 @@ with tab4:
     st.subheader("🔀 Source Cross-Reference: Reliable vs Unreliable Scoring")
     st.caption(
         "Cross-references **feedback_loop_prod** with the **Master Sources sheet** "
-        "(Documents and URLs tab). Groups updates by jurisdiction and document, "
+        "(Documents and URLs tab). Groups updates by jurisdiction and document name, "
         "calculates how often the analyst agreed with the model score, "
-        "and identifies which sources are reliably or poorly scored. "
+        "and identifies which sources the model scores reliably vs poorly. "
         "Only sources with at least 5 analyst-reviewed updates are included."
     )
 
@@ -454,92 +472,85 @@ with tab4:
     elif df_sources.empty:
         st.warning(
             "Master Sources sheet could not be loaded. "
-            "Check that the sheet is publicly accessible (File → Share → Anyone with link → Viewer)."
+            "Make sure the sheet has been shared with your service account email "
+            "and that the `gcp_service_account` credentials are set in Streamlit secrets."
         )
     else:
         with st.spinner("Computing source-level accuracy..."):
-            reliable, poor = compute_source_accuracy(df_feedback, df_sources)
+            reliable, poor, full = compute_source_accuracy(df_feedback, df_sources)
 
-        if reliable.empty:
+        if reliable.empty and poor.empty:
             st.warning(
                 "Not enough reviewed data to compute source-level accuracy. "
                 "At least 5 analyst-reviewed updates per source are required."
             )
         else:
+            # Display columns — only show ones that exist after the merge
+            display_cols = [
+                c for c in [
+                    "Jurisdiction","Document / Source","Industry","Authority","Banding",
+                    "Analyst Reviewed","Overall Agreement %","Accuracy 3s %","Accuracy 1s %",
+                ] if c in (reliable.columns if not reliable.empty else poor.columns)
+            ]
+            fmt = {
+                "Overall Agreement %": "{:.1f}%",
+                "Accuracy 3s %":       "{:.1f}%",
+                "Accuracy 1s %":       "{:.1f}%",
+            }
+
             col_a, col_b = st.columns(2)
 
             with col_a:
                 st.markdown("##### ✅ Top 10 Most Reliably Scored Sources")
                 st.caption(
-                    "Sources where the model's score most consistently matched the analyst's score. "
-                    "**Overall Agreement %** = % of reviewed updates where model score = analyst score. "
-                    "These are sources the model handles well — likely consistent, clearly structured content."
-                )
-                reliable_display = reliable[[
-                    c for c in [
-                        "Jurisdiction","Document / Source","Industry","Authority","Banding",
-                        "Analyst Reviewed","Overall Agreement %","Accuracy 3s %","Accuracy 1s %"
-                    ] if c in reliable.columns
-                ]]
-                st.dataframe(
-                    reliable_display.style.format({
-                        "Overall Agreement %": "{:.1f}%",
-                        "Accuracy 3s %": "{:.1f}%",
-                        "Accuracy 1s %": "{:.1f}%",
-                    }, na_rep="-"),
-                    use_container_width=True,
+                    "Sources where the model's score most consistently matched the analyst's. "
+                    "**Overall Agreement %** = % of reviewed updates where model = analyst score. "
+                    "These are sources the model handles well — usually consistent, clearly structured content."
                 )
                 if not reliable.empty:
-                    st.bar_chart(
-                        reliable.set_index("Jurisdiction")["Overall Agreement %"].head(10)
+                    st.dataframe(
+                        reliable[display_cols].style.format(fmt, na_rep="-"),
+                        use_container_width=True,
                     )
+                    st.bar_chart(
+                        reliable.set_index("Jurisdiction")["Overall Agreement %"]
+                    )
+                else:
+                    st.info("No reliable sources found for this period.")
 
             with col_b:
                 st.markdown("##### ❌ Top 10 Most Poorly Scored Sources")
                 st.caption(
-                    "Sources where the model's score most often differed from the analyst's score. "
+                    "Sources where the model most often disagreed with the analyst. "
                     "Low agreement % = the model is frequently getting these wrong. "
-                    "These sources may need prompt tuning, re-classification, or manual review priority."
-                )
-                poor_display = poor[[
-                    c for c in [
-                        "Jurisdiction","Document / Source","Industry","Authority","Banding",
-                        "Analyst Reviewed","Overall Agreement %","Accuracy 3s %","Accuracy 1s %"
-                    ] if c in poor.columns
-                ]]
-                st.dataframe(
-                    poor_display.style.format({
-                        "Overall Agreement %": "{:.1f}%",
-                        "Accuracy 3s %": "{:.1f}%",
-                        "Accuracy 1s %": "{:.1f}%",
-                    }, na_rep="-"),
-                    use_container_width=True,
+                    "These may need prompt tuning, re-classification, or manual review priority."
                 )
                 if not poor.empty:
-                    st.bar_chart(
-                        poor.set_index("Jurisdiction")["Overall Agreement %"].head(10)
+                    st.dataframe(
+                        poor[display_cols].style.format(fmt, na_rep="-"),
+                        use_container_width=True,
                     )
+                    st.bar_chart(
+                        poor.set_index("Jurisdiction")["Overall Agreement %"]
+                    )
+                else:
+                    st.info("No poorly scored sources found for this period.")
 
             st.divider()
             st.markdown("##### 📋 Full Source Accuracy Table")
             st.caption(
                 "All sources with at least 5 reviewed updates, sorted by agreement % descending. "
-                "Use this to find any source you want to investigate."
+                "Use this to investigate any specific source."
             )
-            all_stats, _ = compute_source_accuracy(df_feedback, df_sources)
-            if not all_stats.empty:
-                full_display = all_stats[[
+            if not full.empty:
+                full_cols = [
                     c for c in [
                         "Jurisdiction","Document / Source","Industry","Authority","Banding",
                         "Total Updates","Analyst Reviewed","Overall Agreement %",
-                        "Accuracy 3s %","Accuracy 1s %"
-                    ] if c in all_stats.columns
-                ]]
+                        "Accuracy 3s %","Accuracy 1s %",
+                    ] if c in full.columns
+                ]
                 st.dataframe(
-                    full_display.style.format({
-                        "Overall Agreement %": "{:.1f}%",
-                        "Accuracy 3s %": "{:.1f}%",
-                        "Accuracy 1s %": "{:.1f}%",
-                    }, na_rep="-"),
+                    full[full_cols].style.format(fmt, na_rep="-"),
                     use_container_width=True,
                 )
