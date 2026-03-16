@@ -17,29 +17,56 @@ def get_cursor():
         cursor_class=PandasCursor,
     ).cursor()
 
-# ── Data loaders ──────────────────────────────────────────────────────────────
+# ── Data loaders — use partition columns to avoid full scans ──────────────────
 @st.cache_data(ttl=600)
-def load_scored_updates(start_date: str, end_date: str):
+def load_feedback_loop(year: str, month: str):
     return get_cursor().execute(f"""
-        SELECT *
-        FROM scans.scored_updates
-        WHERE score_updated_date BETWEEN '{start_date}' AND '{end_date}'
-    """).as_pandas()
-
-@st.cache_data(ttl=600)
-def load_feedback_loop(start_date: str, end_date: str):
-    return get_cursor().execute(f"""
-        SELECT *
+        SELECT
+            content_id,
+            ai_meta_id,
+            score_updated_date,
+            created_date,
+            document_name,
+            jurisdiction,
+            vertical,
+            ai_score,
+            ai_score_reason,
+            analyst_score,
+            analyst_score_reason,
+            status,
+            status_id
         FROM scans.feedback_loop_prod
-        WHERE score_updated_date BETWEEN '{start_date}' AND '{end_date}'
+        WHERE year = '{year}' AND month = '{month}'
     """).as_pandas()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def compute_accuracy(df):
-    """
-    Model accuracy for 3s  = 3s accepted / total 3s * 100
-    Model accuracy for 1s  = (total 1s - 1s accepted) / total 1s * 100
-    """
+@st.cache_data(ttl=600)
+def load_scored_updates(year: str, month: str):
+    return get_cursor().execute(f"""
+        SELECT
+            content_id,
+            document_title,
+            jurisdiction,
+            vertical,
+            authority,
+            score,
+            score_reason,
+            confidence_score,
+            confidence_score_in_words,
+            processed_time,
+            llm_model
+        FROM scans.scored_updates
+        WHERE year = '{year}' AND month = '{month}'
+    """).as_pandas()
+
+# ── Accuracy helpers ──────────────────────────────────────────────────────────
+# A score is "accepted" when analyst_score == ai_score (analyst agreed with model)
+# Model accuracy for 3s = 3s accepted / total 3s * 100
+# Model accuracy for 1s = (total 1s - 1s accepted) / total 1s * 100
+
+BENCHMARK_3S = 80.0  # update with your real benchmarks
+BENCHMARK_1S = 70.0
+
+def compute_summary(df):
     results = []
     for industry, grp in df.groupby("jurisdiction"):
         total_3 = len(grp[grp["ai_score"] == 3])
@@ -47,166 +74,149 @@ def compute_accuracy(df):
         total_1 = len(grp[grp["ai_score"] == 1])
         unscored = len(grp[grp["ai_score"].isna()])
 
-        accepted_3 = len(grp[(grp["ai_score"] == 3) & (grp["accepted"] == True)])
-        accepted_1 = len(grp[(grp["ai_score"] == 1) & (grp["accepted"] == True)])
+        accepted_3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
+        accepted_1 = len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)])
 
         acc_3 = round(accepted_3 / total_3 * 100, 1) if total_3 > 0 else None
         acc_1 = round((total_1 - accepted_1) / total_1 * 100, 1) if total_1 > 0 else None
 
-        pending_review = len(grp[(grp["ai_score"].isin([2, 3])) & (grp["accepted"].isna())])
+        pending = len(grp[
+            (grp["ai_score"].isin([2, 3])) &
+            (grp["analyst_score"].isna())
+        ])
 
         results.append({
             "Industry": industry,
-            "Total Score 3": total_3,
-            "Total Score 2": total_2,
-            "Total Score 1": total_1,
+            "Score 3": total_3,
+            "Score 2": total_2,
+            "Score 1": total_1,
             "Unscored": unscored,
             "3s Accepted": accepted_3,
             "1s Accepted": accepted_1,
-            "Model Accuracy (3s) %": acc_3,
-            "Model Accuracy (1s) %": acc_1,
-            "Pending Review (3s+2s)": pending_review,
+            "Accuracy 3s %": acc_3,
+            "Accuracy 1s %": acc_1,
+            "Pending Review (3s+2s)": pending,
         })
     return pd.DataFrame(results)
 
-BENCHMARK_3S = 80.0   # replace with real benchmark values
-BENCHMARK_1S = 70.0
-
-def style_accuracy(val, benchmark):
-    if val is None:
+def colour_cell(val, benchmark):
+    if pd.isna(val) or val is None:
         return ""
-    color = "green" if val >= benchmark else "red"
-    return f"color: {color}; font-weight: bold"
+    return f"color: {'green' if val >= benchmark else 'red'}; font-weight: bold"
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ── Date controls ─────────────────────────────────────────────────────────────
 st.title("📊 Model Accuracy Dashboard")
 
-# Date range selector
 col1, col2 = st.columns(2)
 with col1:
-    start_date = st.date_input("From", value=datetime.today() - timedelta(days=7))
-with col2:
-    end_date = st.date_input("To", value=datetime.today())
+    selected_date = st.date_input("Select month", value=datetime.today().replace(day=1))
 
-start_str = start_date.strftime("%Y-%m-%d")
-end_str = end_date.strftime("%Y-%m-%d")
+year_str  = selected_date.strftime("%Y")
+month_str = selected_date.strftime("%m")
 
 try:
     with st.spinner("Loading data..."):
-        df_scored = load_scored_updates(start_str, end_str)
-        df_feedback = load_feedback_loop(start_str, end_str)
+        df_feedback = load_feedback_loop(year_str, month_str)
+        df_scored   = load_scored_updates(year_str, month_str)
 except Exception as e:
     st.error(f"Error loading data: {e}")
     st.stop()
 
-# ── Tab layout ────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📋 Weekly Summary", "🔬 Accuracy Deep Dive", "👤 Analyst Breakdown"])
+st.caption(f"Showing data for **{selected_date.strftime('%B %Y')}** — "
+           f"{len(df_feedback):,} feedback rows | {len(df_scored):,} scored rows")
 
-# ── TAB 1: Weekly Summary Stats ───────────────────────────────────────────────
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["📋 Weekly Summary", "📈 Accuracy Trends", "🔍 Scored Updates"])
+
+# ── TAB 1: Weekly Summary ─────────────────────────────────────────────────────
 with tab1:
-    st.subheader("Weekly Summary by Industry")
-    st.caption(f"Period: {start_str} → {end_str}")
+    st.subheader("Model Accuracy Summary by Industry")
 
     if df_feedback.empty:
-        st.warning("No data found for the selected date range.")
+        st.warning("No data found for the selected month.")
     else:
-        summary = compute_accuracy(df_feedback)
+        summary = compute_summary(df_feedback)
 
-        # Colour accuracy columns against benchmarks
-        def highlight_3s(val):
-            return style_accuracy(val, BENCHMARK_3S)
-
-        def highlight_1s(val):
-            return style_accuracy(val, BENCHMARK_1S)
-
-        styled = summary.style \
-            .applymap(highlight_3s, subset=["Model Accuracy (3s) %"]) \
-            .applymap(highlight_1s, subset=["Model Accuracy (1s) %"])
-
+        styled = (
+            summary.style
+            .applymap(lambda v: colour_cell(v, BENCHMARK_3S), subset=["Accuracy 3s %"])
+            .applymap(lambda v: colour_cell(v, BENCHMARK_1S), subset=["Accuracy 1s %"])
+            .format({"Accuracy 3s %": "{:.1f}%", "Accuracy 1s %": "{:.1f}%"}, na_rep="-")
+        )
         st.dataframe(styled, use_container_width=True)
 
-        # Bar charts
-        st.subheader("Score Distribution by Industry")
-        chart_data = summary.set_index("Industry")[["Total Score 3", "Total Score 2", "Total Score 1", "Unscored"]]
-        st.bar_chart(chart_data)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Score Distribution by Industry**")
+            st.bar_chart(summary.set_index("Industry")[["Score 3","Score 2","Score 1","Unscored"]])
+        with col_b:
+            st.markdown("**Model Accuracy % vs Benchmark**")
+            acc = summary.set_index("Industry")[["Accuracy 3s %","Accuracy 1s %"]].dropna(how="all")
+            st.bar_chart(acc)
 
-        st.subheader("Model Accuracy % by Industry")
-        acc_data = summary.set_index("Industry")[["Model Accuracy (3s) %", "Model Accuracy (1s) %"]].dropna(how="all")
-        st.bar_chart(acc_data)
+        st.markdown("**Still Pending Review (3s + 2s)**")
+        st.bar_chart(summary.set_index("Industry")[["Pending Review (3s+2s)"]])
 
-        st.subheader("Pending Review (3s + 2s) by Industry")
-        pending = summary.set_index("Industry")[["Pending Review (3s+2s)"]]
-        st.bar_chart(pending)
-
-# ── TAB 2: Accuracy Deep Dive — weekly trend ──────────────────────────────────
+# ── TAB 2: Weekly Accuracy Trend ──────────────────────────────────────────────
 with tab2:
-    st.subheader("Model Accuracy — Weekly Trend")
+    st.subheader("Weekly Accuracy Trend")
 
     if df_feedback.empty:
-        st.warning("No data found for the selected date range.")
+        st.warning("No data found for the selected month.")
     else:
-        # Group by week + industry
-        df_feedback["week"] = pd.to_datetime(df_feedback["score_updated_date"]).dt.to_period("W").astype(str)
+        df_feedback["week"] = pd.to_datetime(
+            df_feedback["score_updated_date"], errors="coerce"
+        ).dt.to_period("W").astype(str)
 
         weekly = []
-        for (week, industry), grp in df_feedback.groupby(["week", "jurisdiction"]):
-            total_3 = len(grp[grp["ai_score"] == 3])
-            total_1 = len(grp[grp["ai_score"] == 1])
-            accepted_3 = len(grp[(grp["ai_score"] == 3) & (grp["accepted"] == True)])
-            accepted_1 = len(grp[(grp["ai_score"] == 1) & (grp["accepted"] == True)])
-            acc_3 = round(accepted_3 / total_3 * 100, 1) if total_3 > 0 else None
-            acc_1 = round((total_1 - accepted_1) / total_1 * 100, 1) if total_1 > 0 else None
-            weekly.append({"Week": week, "Industry": industry,
-                           "Accuracy 3s %": acc_3, "Accuracy 1s %": acc_1})
+        for (week, ind), grp in df_feedback.groupby(["week", "jurisdiction"]):
+            t3 = len(grp[grp["ai_score"] == 3])
+            t1 = len(grp[grp["ai_score"] == 1])
+            a3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
+            a1 = len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)])
+            weekly.append({
+                "Week": week, "Industry": ind,
+                "Accuracy 3s %": round(a3/t3*100, 1) if t3 > 0 else None,
+                "Accuracy 1s %": round((t1-a1)/t1*100, 1) if t1 > 0 else None,
+            })
 
-        df_weekly = pd.DataFrame(weekly)
+        df_w = pd.DataFrame(weekly)
+        industries = sorted(df_w["Industry"].dropna().unique())
+        sel = st.multiselect("Filter industries", industries, default=industries[:6])
+        df_w = df_w[df_w["Industry"].isin(sel)]
 
-        industry_list = sorted(df_weekly["Industry"].dropna().unique())
-        selected = st.multiselect("Filter by Industry", industry_list, default=industry_list[:5])
-        filtered = df_weekly[df_weekly["Industry"].isin(selected)]
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown(f"**Score 3 Accuracy % (benchmark: {BENCHMARK_3S}%)**")
+            p3 = df_w.pivot(index="Week", columns="Industry", values="Accuracy 3s %")
+            p3["Benchmark"] = BENCHMARK_3S
+            st.line_chart(p3)
+        with col_b:
+            st.markdown(f"**Score 1 Accuracy % (benchmark: {BENCHMARK_1S}%)**")
+            p1 = df_w.pivot(index="Week", columns="Industry", values="Accuracy 1s %")
+            p1["Benchmark"] = BENCHMARK_1S
+            st.line_chart(p1)
 
-        pivot_3 = filtered.pivot(index="Week", columns="Industry", values="Accuracy 3s %")
-        pivot_1 = filtered.pivot(index="Week", columns="Industry", values="Accuracy 1s %")
-
-        st.markdown("**Score 3 Accuracy % vs Benchmark**")
-        if not pivot_3.empty:
-            benchmark_line = pd.DataFrame({"Benchmark": [BENCHMARK_3S] * len(pivot_3)}, index=pivot_3.index)
-            st.line_chart(pd.concat([pivot_3, benchmark_line], axis=1))
-
-        st.markdown("**Score 1 Accuracy % vs Benchmark**")
-        if not pivot_1.empty:
-            benchmark_line = pd.DataFrame({"Benchmark": [BENCHMARK_1S] * len(pivot_1)}, index=pivot_1.index)
-            st.line_chart(pd.concat([pivot_1, benchmark_line], axis=1))
-
-# ── TAB 3: Analyst Breakdown ──────────────────────────────────────────────────
+# ── TAB 3: Scored Updates Explorer ───────────────────────────────────────────
 with tab3:
-    st.subheader("Per-Analyst Breakdown")
-    st.caption("Updates received by score and number published, per analyst")
-
-    # scored_updates is expected to have analyst/user info
-    analyst_col = None
-    for candidate in ["analyst", "analyst_id", "user_id", "user", "assigned_to"]:
-        if candidate in df_scored.columns:
-            analyst_col = candidate
-            break
+    st.subheader("Scored Updates Detail")
 
     if df_scored.empty:
-        st.warning("No scored_updates data for the selected date range.")
-    elif analyst_col is None:
-        st.warning("Could not find an analyst/user column in scored_updates. Available columns: "
-                   + ", ".join(df_scored.columns.tolist()))
-        st.dataframe(df_scored.head(20), use_container_width=True)
+        st.warning("No scored_updates data for the selected month.")
     else:
-        analyst_summary = []
-        for analyst, grp in df_scored.groupby(analyst_col):
-            row = {"Analyst": analyst}
-            for score in [3, 2, 1]:
-                row[f"Score {score} Received"] = len(grp[grp["ai_score"] == score])
-            row["Unscored"] = len(grp[grp["ai_score"].isna()])
-            if "published" in grp.columns:
-                row["Published"] = grp["published"].sum()
-            analyst_summary.append(row)
+        industries = ["All"] + sorted(df_scored["jurisdiction"].dropna().unique())
+        sel_ind = st.selectbox("Filter by Industry", industries)
+        view = df_scored if sel_ind == "All" else df_scored[df_scored["jurisdiction"] == sel_ind]
 
-        df_analyst = pd.DataFrame(analyst_summary)
-        st.dataframe(df_analyst, use_container_width=True)
-        st.bar_chart(df_analyst.set_index("Analyst")[["Score 3 Received", "Score 2 Received", "Score 1 Received"]])
+        st.markdown(f"**Score distribution** ({len(view):,} records)")
+        score_counts = view["score"].value_counts().sort_index()
+        st.bar_chart(score_counts)
+
+        st.markdown("**Confidence Score Distribution**")
+        st.bar_chart(view["confidence_score"].value_counts().sort_index())
+
+        st.dataframe(view[[
+            "content_id", "document_title", "jurisdiction", "vertical",
+            "score", "confidence_score", "confidence_score_in_words",
+            "llm_model", "processed_time"
+        ]].sort_values("processed_time", ascending=False), use_container_width=True)
