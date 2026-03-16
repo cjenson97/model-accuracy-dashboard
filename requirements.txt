@@ -1,5 +1,4 @@
 streamlit
+boto3
 pyathena
 pandas
-plotly
-boto3
