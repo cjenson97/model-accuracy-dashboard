@@ -9,6 +9,20 @@ st.set_page_config(page_title="Model Accuracy Dashboard", layout="wide")
 BENCHMARK_3S = 80.0
 BENCHMARK_1S = 70.0
 
+# ── Tier 1 jurisdictions (FS banding = 1. High from the banding sheet) ────────
+TIER1_JURISDICTIONS = {
+    "argentina", "australia", "austria", "belgium", "brazil", "bulgaria",
+    "california", "chile", "croatia", "cyprus", "czech republic", "denmark",
+    "estonia", "european union", "federal (canada)", "federal (us)", "finland",
+    "florida", "france", "germany", "greece", "hong kong", "hungary", "india",
+    "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta",
+    "massachusetts", "netherlands", "new york", "new zealand", "norway",
+    "ontario", "poland", "portugal", "romania", "singapore", "slovakia",
+    "slovenia", "south africa", "south korea", "spain", "sweden", "switzerland",
+    "turkey", "ukraine", "united kingdom", "united states, texas",
+    "united states, virginia", "wales",
+}
+
 # ── Connection ────────────────────────────────────────────────────────────────
 def get_cursor():
     return connect(
@@ -79,6 +93,25 @@ def filter_by_week(df, date_col, week_start, week_end):
         (dates <= pd.Timestamp(week_end).tz_localize(None))
     ]
 
+def is_tier1(jurisdiction):
+    return str(jurisdiction).strip().lower() in TIER1_JURISDICTIONS
+
+def filter_tier1(df, jx_col="jurisdiction"):
+    return df[df[jx_col].apply(is_tier1)]
+
+def filter_analyst_changed(df):
+    """Keep only rows where analyst actively disagreed with the AI score.
+    Excludes: unscored (no ai_score), not reviewed (no analyst_score),
+    and cases where analyst agreed."""
+    df = df.copy()
+    df["ai_score"] = pd.to_numeric(df["ai_score"], errors="coerce")
+    df["analyst_score"] = pd.to_numeric(df["analyst_score"], errors="coerce")
+    return df[
+        df["ai_score"].notna() &
+        df["analyst_score"].notna() &
+        (df["ai_score"] != df["analyst_score"])
+    ]
+
 def compute_summary(df):
     results = []
     for industry, grp in df.groupby("jurisdiction"):
@@ -119,12 +152,86 @@ def colour_score(val):
         return "color: orange; font-weight: bold"
     return "color: red; font-weight: bold"
 
+def generate_summary_text(summary_df, period_label):
+    """Generate a plain-English summary of the accuracy table."""
+    if summary_df.empty:
+        return "No data available for this period."
+    acc3 = summary_df["Accuracy 3s %"].dropna()
+    acc1 = summary_df["Accuracy 1s %"].dropna()
+    below3 = summary_df[summary_df["Accuracy 3s %"].notna() & (summary_df["Accuracy 3s %"] < BENCHMARK_3S)]
+    below1 = summary_df[summary_df["Accuracy 1s %"].notna() & (summary_df["Accuracy 1s %"] < BENCHMARK_1S)]
+    avg3 = round(acc3.mean(), 1) if len(acc3) > 0 else None
+    avg1 = round(acc1.mean(), 1) if len(acc1) > 0 else None
+    total_pending = int(summary_df["Pending Review"].sum())
+    lines = []
+    if avg3 is not None:
+        status3 = "above" if avg3 >= BENCHMARK_3S else "below"
+        lines.append(f"For **{period_label}**, average Score 3 accuracy across Tier 1 jurisdictions is **{avg3}%** — {status3} the {BENCHMARK_3S}% benchmark.")
+    if len(below3) > 0:
+        worst3 = below3.sort_values("Accuracy 3s %").head(3)["Industry"].tolist()
+        lines.append(f"**{len(below3)} jurisdiction(s)** are below the Score 3 benchmark. The worst performers are: **{', '.join(worst3)}**.")
+    else:
+        lines.append("All Tier 1 jurisdictions are meeting the Score 3 accuracy benchmark.")
+    if avg1 is not None:
+        status1 = "above" if avg1 >= BENCHMARK_1S else "below"
+        lines.append(f"Average Score 1 accuracy is **{avg1}%** — {status1} the {BENCHMARK_1S}% benchmark.")
+    if len(below1) > 0:
+        worst1 = below1.sort_values("Accuracy 1s %").head(3)["Industry"].tolist()
+        lines.append(f"**{len(below1)} jurisdiction(s)** are below the Score 1 benchmark, including: **{', '.join(worst1)}**.")
+    if total_pending > 0:
+        lines.append(f"There are **{total_pending:,} updates** still pending analyst review — accuracy figures may improve once reviewed.")
+    return " ".join(lines)
+
+def generate_trend_summary(df_w, period_label):
+    """Generate a plain-English summary of the weekly trend data."""
+    if df_w.empty:
+        return "Not enough data to summarise trends."
+    lines = []
+    acc3 = df_w.groupby("Industry")["Accuracy 3s %"].mean().dropna()
+    declining = []
+    for ind in df_w["Industry"].dropna().unique():
+        sub = df_w[df_w["Industry"] == ind].sort_values("Week")["Accuracy 3s %"].dropna()
+        if len(sub) >= 2 and sub.iloc[-1] < sub.iloc[0]:
+            declining.append(ind)
+    below_avg = acc3[acc3 < BENCHMARK_3S]
+    if len(below_avg) > 0:
+        lines.append(f"Over the selected weeks, **{len(below_avg)} jurisdiction(s)** averaged below the {BENCHMARK_3S}% Score 3 benchmark: **{', '.join(below_avg.index.tolist()[:3])}**{'...' if len(below_avg) > 3 else ''}.")
+    else:
+        lines.append("All selected jurisdictions averaged above the Score 3 benchmark over the selected period.")
+    if declining:
+        lines.append(f"**Declining trend** in Score 3 accuracy detected for: **{', '.join(declining[:3])}**{'...' if len(declining) > 3 else ''}. These jurisdictions scored better earlier in the period.")
+    return " ".join(lines) if lines else "Accuracy trends look stable across the selected period."
+
+def generate_sources_summary(df_top, period_label):
+    """Generate a plain-English summary of the top inaccurate sources."""
+    if df_top.empty:
+        return "No qualifying sources found."
+    total = len(df_top)
+    below = len(df_top[df_top["Overall Agreement %"].notna() & (df_top["Overall Agreement %"] < BENCHMARK_3S)])
+    avg = round(df_top["Overall Agreement %"].dropna().mean(), 1)
+    worst = df_top.head(3)["Document / Source"].tolist()
+    lines = [
+        f"Across the last 6 months, **{total} Tier 1 sources** had enough analyst-reviewed records to be assessed.",
+        f"**{below} of those ({round(below/total*100)}%)** are below the 80% agreement threshold — meaning analysts disagreed with the AI on more than 1 in 5 updates.",
+        f"Average analyst agreement across all reviewed Tier 1 sources is **{avg}%**.",
+        f"The most problematic sources right now are: **{', '.join(worst)}**.",
+    ]
+    return " ".join(lines)
+
 def compute_top_inaccurate_sources_6m(df):
     if df.empty:
         return pd.DataFrame()
     df = df.copy()
     df["ai_score"] = pd.to_numeric(df["ai_score"], errors="coerce")
     df["analyst_score"] = pd.to_numeric(df["analyst_score"], errors="coerce")
+    # Only analyst-changed records
+    df = df[
+        df["ai_score"].notna() &
+        df["analyst_score"].notna() &
+        (df["ai_score"] != df["analyst_score"])
+    ]
+    # Only Tier 1 jurisdictions
+    df = filter_tier1(df)
     rows = []
     for (doc, jx), grp in df.groupby(["document_name", "jurisdiction"], dropna=False):
         reviewed = int(grp["analyst_score"].notna().sum())
@@ -143,12 +250,11 @@ def compute_top_inaccurate_sources_6m(df):
             "Document / Source": doc,
             "Jurisdiction": jx,
             "Vertical": vertical,
-            "Total Updates": total,
+            "Total Disagreements": total,
             "Analyst Reviewed": reviewed,
-            "Score 3": s3,
-            "Score 2": s2,
-            "Score 1": s1,
-            "Unscored": unscored,
+            "AI Score 3 → Changed": s3,
+            "AI Score 2 → Changed": s2,
+            "AI Score 1 → Changed": s1,
             "Overall Agreement %": round(agreed / reviewed * 100, 1) if reviewed > 0 else None,
             "Accuracy 3s %": round(accepted_3 / s3 * 100, 1) if s3 > 0 else None,
             "Accuracy 1s %": round((s1 - accepted_1) / s1 * 100, 1) if s1 > 0 else None,
@@ -163,6 +269,7 @@ def compute_top_inaccurate_sources_6m(df):
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("Model Accuracy Dashboard")
+st.caption("Showing **Tier 1 jurisdictions only** · Accuracy based on records where an analyst actively changed the AI score")
 
 # ── Period selector ───────────────────────────────────────────────────────────
 year_col, month_col, week_col, period_col = st.columns(4)
@@ -205,8 +312,8 @@ with period_col:
 # ── Load data ─────────────────────────────────────────────────────────────────
 try:
     with st.spinner("Loading data..."):
-        df_feedback = load_feedback_loop(year, month_str)
-        df_scored = load_scored_updates(year, month_str)
+        df_feedback_raw = load_feedback_loop(year, month_str)
+        df_scored_raw = load_scored_updates(year, month_str)
 except Exception as e:
     st.error(f"Error loading data: {e}")
     st.stop()
@@ -215,12 +322,21 @@ if week_option != "All weeks":
     week_idx = weeks.index(week_option)
     week_start = first_day + timedelta(weeks=week_idx)
     week_end = min(week_start + timedelta(days=6), last_day)
-    df_feedback = filter_by_week(df_feedback, "score_updated_date", week_start, week_end)
-    df_scored = filter_by_week(df_scored, "processed_time", week_start, week_end)
+    df_feedback_raw = filter_by_week(df_feedback_raw, "score_updated_date", week_start, week_end)
+    df_scored_raw = filter_by_week(df_scored_raw, "processed_time", week_start, week_end)
+
+# Apply Tier 1 filter
+df_feedback = filter_tier1(df_feedback_raw)
+df_scored = filter_tier1(df_scored_raw)
+
+# Analyst-changed only (for accuracy calculations)
+df_feedback_changed = filter_analyst_changed(df_feedback)
 
 period_label = f"week of {week_option}" if week_option != "All weeks" else f"{month_name} {year}"
 st.caption(
-    f"**{len(df_feedback):,}** feedback rows | **{len(df_scored):,}** scored rows — {period_label}"
+    f"**{len(df_feedback):,}** Tier 1 feedback rows "
+    f"(**{len(df_feedback_changed):,}** analyst-changed) | "
+    f"**{len(df_scored):,}** scored rows — {period_label}"
 )
 st.divider()
 
@@ -236,18 +352,20 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1 — Weekly Summary
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    st.subheader("Model Accuracy Summary by Industry")
+    st.subheader("Model Accuracy Summary — Tier 1 Jurisdictions")
     st.caption(
-        "Source: feedback_loop_prod. Score 3/2/1 = model rating. "
-        "Accuracy 3s % = analyst agreement on score-3s. "
-        "Accuracy 1s % = analyst agreement on score-1s. "
-        "Green = at/above benchmark. Red = below."
+        "Only records where an analyst reviewed **and actively changed** the AI score are included. "
+        "Unscored updates and un-reviewed records are excluded from accuracy calculations."
     )
 
-    if df_feedback.empty:
-        st.warning("No data found for the selected period.")
+    if df_feedback_changed.empty:
+        st.warning("No analyst-changed records found for this period in Tier 1 jurisdictions.")
     else:
-        summary = compute_summary(df_feedback)
+        summary = compute_summary(df_feedback_changed)
+
+        # ── AI-generated summary ──────────────────────────────────────────────
+        with st.expander("Summary Insight", expanded=True):
+            st.info(generate_summary_text(summary, period_label))
 
         styled = (
             summary.style
@@ -262,11 +380,12 @@ with tab1:
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown("##### Score Distribution by Industry")
+            st.caption("How many updates the analyst changed per score level, by jurisdiction.")
             st.bar_chart(
-                summary.set_index("Industry")[["Score 3", "Score 2", "Score 1", "Unscored"]]
+                summary.set_index("Industry")[["Score 3", "Score 2", "Score 1"]]
             )
         with col_b:
-            st.markdown("##### Model Accuracy % by Industry")
+            st.markdown("##### Accuracy % by Industry")
             st.caption(f"Benchmarks: 3s = {BENCHMARK_3S}%, 1s = {BENCHMARK_1S}%")
             acc = (
                 summary.set_index("Industry")[["Accuracy 3s %", "Accuracy 1s %"]]
@@ -276,28 +395,28 @@ with tab1:
 
         st.divider()
         st.markdown("##### Pending Analyst Review")
-        st.caption("Score-3 and score-2 updates not yet reviewed. Large bars = backlog.")
+        st.caption("Tier 1 updates scored 2 or 3 that haven't been reviewed yet.")
         st.bar_chart(summary.set_index("Industry")[["Pending Review"]])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — Weekly Accuracy Trend
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab2:
-    st.subheader("Weekly Accuracy Trend")
-    st.caption("Accuracy week-by-week within the selected month.")
+    st.subheader("Weekly Accuracy Trend — Tier 1 Jurisdictions")
+    st.caption("Week-by-week accuracy based on analyst-changed records only.")
 
-    if df_feedback.empty:
-        st.warning("No data found for the selected period.")
+    if df_feedback_changed.empty:
+        st.warning("No analyst-changed records found for this period.")
     else:
-        df_feedback["week"] = (
-            pd.to_datetime(df_feedback["score_updated_date"], errors="coerce")
+        df_feedback_changed["week"] = (
+            pd.to_datetime(df_feedback_changed["score_updated_date"], errors="coerce")
             .dt.tz_localize(None)
             .dt.to_period("W")
             .astype(str)
         )
 
         weekly = []
-        for (week, ind), grp in df_feedback.groupby(["week", "jurisdiction"]):
+        for (week, ind), grp in df_feedback_changed.groupby(["week", "jurisdiction"]):
             t3 = len(grp[grp["ai_score"] == 3])
             t1 = len(grp[grp["ai_score"] == 1])
             a3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
@@ -315,18 +434,22 @@ with tab2:
             st.warning("Not enough data to build weekly trends.")
         else:
             industries = sorted(df_w["Industry"].dropna().unique())
-            sel = st.multiselect("Filter by industry", industries, default=industries[:6])
-            df_w = df_w[df_w["Industry"].isin(sel)]
+            sel = st.multiselect("Filter by jurisdiction", industries, default=industries[:6])
+            df_w_filtered = df_w[df_w["Industry"].isin(sel)]
+
+            # ── AI-generated summary ──────────────────────────────────────────
+            with st.expander("Trend Insight", expanded=True):
+                st.info(generate_trend_summary(df_w_filtered, period_label))
 
             col_a, col_b = st.columns(2)
             with col_a:
                 st.markdown("##### Score 3 Accuracy % per Week")
-                p3 = df_w.pivot(index="Week", columns="Industry", values="Accuracy 3s %")
+                p3 = df_w_filtered.pivot(index="Week", columns="Industry", values="Accuracy 3s %")
                 p3["-- Benchmark"] = BENCHMARK_3S
                 st.line_chart(p3)
             with col_b:
                 st.markdown("##### Score 1 Accuracy % per Week")
-                p1 = df_w.pivot(index="Week", columns="Industry", values="Accuracy 1s %")
+                p1 = df_w_filtered.pivot(index="Week", columns="Industry", values="Accuracy 1s %")
                 p1["-- Benchmark"] = BENCHMARK_1S
                 st.line_chart(p1)
 
@@ -334,11 +457,11 @@ with tab2:
 # TAB 3 — Scored Updates Explorer
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab3:
-    st.subheader("Scored Updates Detail")
-    st.caption("Source: scored_updates table. Raw model output — no analyst feedback included.")
+    st.subheader("Scored Updates — Tier 1 Jurisdictions")
+    st.caption("Raw model output for Tier 1 jurisdictions. No analyst feedback included.")
 
     if df_scored.empty:
-        st.warning("No scored_updates data for the selected period.")
+        st.warning("No scored_updates data for Tier 1 jurisdictions in the selected period.")
     else:
         col_a, col_b = st.columns(2)
         with col_a:
@@ -348,10 +471,22 @@ with tab3:
             st.markdown("##### Confidence Score Distribution")
             st.bar_chart(df_scored["confidence_score"].value_counts().sort_index())
 
+        # Quick summary
+        score_counts = df_scored["score"].value_counts().sort_index()
+        total_sc = len(df_scored)
+        pct3 = round(score_counts.get(3, 0) / total_sc * 100, 1) if total_sc > 0 else 0
+        pct1 = round(score_counts.get(1, 0) / total_sc * 100, 1) if total_sc > 0 else 0
+        with st.expander("Score Distribution Insight", expanded=True):
+            st.info(
+                f"The model processed **{total_sc:,} updates** from Tier 1 jurisdictions this period. "
+                f"**{pct3}%** were rated high relevance (Score 3) and **{pct1}%** were rated low relevance (Score 1). "
+                f"A high proportion of Score 3s means the model is flagging a lot as important — cross-reference with the accuracy tab to check if analysts agree."
+            )
+
         st.divider()
 
-        industries = ["All"] + sorted(df_scored["jurisdiction"].dropna().unique())
-        sel_ind = st.selectbox("Filter by Industry", industries)
+        t1_jx = ["All"] + sorted(df_scored["jurisdiction"].dropna().unique())
+        sel_ind = st.selectbox("Filter by Jurisdiction", t1_jx)
         view = df_scored if sel_ind == "All" else df_scored[df_scored["jurisdiction"] == sel_ind]
 
         st.markdown(f"##### Raw Records ({len(view):,} updates)")
@@ -365,13 +500,13 @@ with tab3:
         )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Top Inaccurate Sources (6 Months) — lazy loaded
+# TAB 4 — Top Inaccurate Sources (6M) — lazy loaded
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab4:
-    st.subheader("Top Inaccurate Sources - Last 6 Months")
+    st.subheader("Top Inaccurate Sources — Tier 1, Last 6 Months")
     st.caption(
-        "Pulls 6 months of feedback_loop_prod from Athena and ranks sources by worst "
-        "analyst agreement. Only sources with 5+ reviewed records are included."
+        "Tier 1 jurisdictions only. Only records where an analyst **actively changed** the AI score are counted. "
+        "Sources with fewer than 5 such records are excluded."
     )
 
     if st.button("Load 6-Month Data", type="primary"):
@@ -385,16 +520,22 @@ with tab4:
         if df_6m.empty:
             st.warning("No data returned for the last 6 months.")
         else:
-            st.caption(f"**{len(df_6m):,}** feedback records loaded across the last 6 months.")
+            t1_count = filter_tier1(df_6m)
+            changed_count = filter_analyst_changed(t1_count)
+            st.caption(
+                f"**{len(df_6m):,}** total records loaded · "
+                f"**{len(t1_count):,}** in Tier 1 jurisdictions · "
+                f"**{len(changed_count):,}** analyst-changed"
+            )
 
             with st.spinner("Computing source accuracy..."):
                 df_top = compute_top_inaccurate_sources_6m(df_6m)
 
             if df_top.empty:
-                st.info("No sources met the minimum threshold (5+ analyst-reviewed records).")
+                st.info("No Tier 1 sources met the minimum threshold (5+ analyst-changed records).")
             else:
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Sources Analysed", len(df_top))
+                col1.metric("Tier 1 Sources Analysed", len(df_top))
                 below = len(df_top[
                     df_top["Overall Agreement %"].notna() &
                     (df_top["Overall Agreement %"] < BENCHMARK_3S)
@@ -402,6 +543,10 @@ with tab4:
                 col2.metric("Sources Below 80% Agreement", below)
                 avg = round(df_top["Overall Agreement %"].dropna().mean(), 1)
                 col3.metric("Avg Overall Agreement %", f"{avg}%")
+
+                # ── AI-generated summary ──────────────────────────────────────
+                with st.expander("Sources Insight", expanded=True):
+                    st.info(generate_sources_summary(df_top, "last 6 months"))
 
                 st.divider()
 
@@ -443,7 +588,7 @@ with tab4:
                 for col in acc_cols:
                     styled_top = styled_top.map(colour_score, subset=[col])
 
-                st.markdown(f"##### Worst {top_n} Sources by Analyst Agreement")
+                st.markdown(f"##### Worst {top_n} Tier 1 Sources by Analyst Agreement")
                 st.dataframe(styled_top, use_container_width=True)
 
                 st.divider()
@@ -453,7 +598,7 @@ with tab4:
                     .dropna(subset=["Overall Agreement %"])
                     .set_index("Document / Source")
                 )
-                st.markdown("##### Overall Agreement % - Worst Sources")
+                st.markdown("##### Overall Agreement % — Worst Sources")
                 st.bar_chart(chart_df)
     else:
         st.info("Click **Load 6-Month Data** above to run this analysis. It queries Athena and may take 20-40 seconds.")
