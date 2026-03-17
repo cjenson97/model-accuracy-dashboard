@@ -99,17 +99,15 @@ def is_tier1(jurisdiction):
 def filter_tier1(df, jx_col="jurisdiction"):
     return df[df[jx_col].apply(is_tier1)]
 
-def filter_analyst_changed(df):
-    """Keep only rows where analyst actively disagreed with the AI score.
-    Excludes: unscored (no ai_score), not reviewed (no analyst_score),
-    and cases where analyst agreed."""
+def filter_analyst_reviewed(df):
+    """Keep only rows where an analyst has reviewed the AI score (agreed or changed).
+    Excludes: unscored (no ai_score) and not-yet-reviewed (no analyst_score)."""
     df = df.copy()
     df["ai_score"] = pd.to_numeric(df["ai_score"], errors="coerce")
     df["analyst_score"] = pd.to_numeric(df["analyst_score"], errors="coerce")
     return df[
         df["ai_score"].notna() &
-        df["analyst_score"].notna() &
-        (df["ai_score"] != df["analyst_score"])
+        df["analyst_score"].notna()
     ]
 
 def compute_summary(df):
@@ -119,11 +117,17 @@ def compute_summary(df):
         total_2 = len(grp[grp["ai_score"] == 2])
         total_1 = len(grp[grp["ai_score"] == 1])
         unscored = len(grp[grp["ai_score"].isna()])
+
+        # Accepted = analyst agreed with the AI score (no change made)
         accepted_3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
         accepted_1 = len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)])
+
+        # Accuracy = how often the AI was correct (analyst agreed / total reviewed for that score)
         acc_3 = round(accepted_3 / total_3 * 100, 1) if total_3 > 0 else None
-        acc_1 = round((total_1 - accepted_1) / total_1 * 100, 1) if total_1 > 0 else None
+        acc_1 = round(accepted_1 / total_1 * 100, 1) if total_1 > 0 else None
+
         pending = len(grp[(grp["ai_score"].isin([2, 3])) & (grp["analyst_score"].isna())])
+
         results.append({
             "Industry": industry,
             "Score 3": total_3,
@@ -153,114 +157,196 @@ def colour_score(val):
     return "color: red; font-weight: bold"
 
 def generate_summary_text(summary_df, period_label):
-    """Generate a plain-English summary of the accuracy table."""
+    """Data-only summary — no inference or narrative, only computed facts."""
     if summary_df.empty:
         return "No data available for this period."
+
     acc3 = summary_df["Accuracy 3s %"].dropna()
     acc1 = summary_df["Accuracy 1s %"].dropna()
-    below3 = summary_df[summary_df["Accuracy 3s %"].notna() & (summary_df["Accuracy 3s %"] < BENCHMARK_3S)]
-    below1 = summary_df[summary_df["Accuracy 1s %"].notna() & (summary_df["Accuracy 1s %"] < BENCHMARK_1S)]
     avg3 = round(acc3.mean(), 1) if len(acc3) > 0 else None
     avg1 = round(acc1.mean(), 1) if len(acc1) > 0 else None
-    total_pending = int(summary_df["Pending Review"].sum())
-    lines = []
+
+    below3 = summary_df[
+        summary_df["Accuracy 3s %"].notna() &
+        (summary_df["Accuracy 3s %"] < BENCHMARK_3S)
+    ].sort_values("Accuracy 3s %")
+
+    below1 = summary_df[
+        summary_df["Accuracy 1s %"].notna() &
+        (summary_df["Accuracy 1s %"] < BENCHMARK_1S)
+    ].sort_values("Accuracy 1s %")
+
+    total_reviewed = int(summary_df[["Score 3", "Score 2", "Score 1"]].sum().sum())
+    total_pending  = int(summary_df["Pending Review"].sum())
+
+    lines = [f"**Period:** {period_label}  |  **Total analyst-reviewed records:** {total_reviewed:,}"]
+
     if avg3 is not None:
-        status3 = "above" if avg3 >= BENCHMARK_3S else "below"
-        lines.append(f"For **{period_label}**, average Score 3 accuracy across Tier 1 jurisdictions is **{avg3}%** — {status3} the {BENCHMARK_3S}% benchmark.")
-    if len(below3) > 0:
-        worst3 = below3.sort_values("Accuracy 3s %").head(3)["Industry"].tolist()
-        lines.append(f"**{len(below3)} jurisdiction(s)** are below the Score 3 benchmark. The worst performers are: **{', '.join(worst3)}**.")
-    else:
-        lines.append("All Tier 1 jurisdictions are meeting the Score 3 accuracy benchmark.")
+        status3 = "✅ above" if avg3 >= BENCHMARK_3S else "🔴 below"
+        lines.append(
+            f"**Score 3 avg accuracy:** {avg3}% — {status3} the {BENCHMARK_3S}% benchmark "
+            f"({len(acc3)} jurisdiction(s) with data)."
+        )
+        if len(below3) > 0:
+            worst3_list = ", ".join(
+                f"{row['Industry']} ({row['Accuracy 3s %']}%)"
+                for _, row in below3.head(3).iterrows()
+            )
+            lines.append(
+                f"**{len(below3)} jurisdiction(s) below Score 3 benchmark:** {worst3_list}"
+                + (" ..." if len(below3) > 3 else ".")
+            )
+        else:
+            lines.append("**All jurisdictions** are at or above the Score 3 benchmark.")
+
     if avg1 is not None:
-        status1 = "above" if avg1 >= BENCHMARK_1S else "below"
-        lines.append(f"Average Score 1 accuracy is **{avg1}%** — {status1} the {BENCHMARK_1S}% benchmark.")
-    if len(below1) > 0:
-        worst1 = below1.sort_values("Accuracy 1s %").head(3)["Industry"].tolist()
-        lines.append(f"**{len(below1)} jurisdiction(s)** are below the Score 1 benchmark, including: **{', '.join(worst1)}**.")
+        status1 = "✅ above" if avg1 >= BENCHMARK_1S else "🔴 below"
+        lines.append(
+            f"**Score 1 avg accuracy:** {avg1}% — {status1} the {BENCHMARK_1S}% benchmark "
+            f"({len(acc1)} jurisdiction(s) with data)."
+        )
+        if len(below1) > 0:
+            worst1_list = ", ".join(
+                f"{row['Industry']} ({row['Accuracy 1s %']}%)"
+                for _, row in below1.head(3).iterrows()
+            )
+            lines.append(
+                f"**{len(below1)} jurisdiction(s) below Score 1 benchmark:** {worst1_list}"
+                + (" ..." if len(below1) > 3 else ".")
+            )
+        else:
+            lines.append("**All jurisdictions** are at or above the Score 1 benchmark.")
+
     if total_pending > 0:
-        lines.append(f"There are **{total_pending:,} updates** still pending analyst review — accuracy figures may improve once reviewed.")
-    return " ".join(lines)
+        lines.append(
+            f"**Pending review:** {total_pending:,} Score 2/3 updates not yet reviewed — "
+            "accuracy figures will update as analysts complete reviews."
+        )
+
+    return "  \n".join(lines)
 
 def generate_trend_summary(df_w, period_label):
-    """Generate a plain-English summary of the weekly trend data."""
+    """Data-only trend summary — lists exact figures, no narrative inference."""
     if df_w.empty:
-        return "Not enough data to summarise trends."
-    lines = []
-    acc3 = df_w.groupby("Industry")["Accuracy 3s %"].mean().dropna()
+        return "No data available for the selected jurisdictions and period."
+
+    acc3 = df_w.groupby("Industry")["Accuracy 3s %"].mean().dropna().round(1)
+    acc1 = df_w.groupby("Industry")["Accuracy 1s %"].mean().dropna().round(1)
+
+    below3 = acc3[acc3 < BENCHMARK_3S].sort_values()
+    above3 = acc3[acc3 >= BENCHMARK_3S].sort_values(ascending=False)
+
+    # Detect declining trend (last week worse than first week)
     declining = []
     for ind in df_w["Industry"].dropna().unique():
         sub = df_w[df_w["Industry"] == ind].sort_values("Week")["Accuracy 3s %"].dropna()
         if len(sub) >= 2 and sub.iloc[-1] < sub.iloc[0]:
-            declining.append(ind)
-    below_avg = acc3[acc3 < BENCHMARK_3S]
-    if len(below_avg) > 0:
-        lines.append(f"Over the selected weeks, **{len(below_avg)} jurisdiction(s)** averaged below the {BENCHMARK_3S}% Score 3 benchmark: **{', '.join(below_avg.index.tolist()[:3])}**{'...' if len(below_avg) > 3 else ''}.")
-    else:
-        lines.append("All selected jurisdictions averaged above the Score 3 benchmark over the selected period.")
-    if declining:
-        lines.append(f"**Declining trend** in Score 3 accuracy detected for: **{', '.join(declining[:3])}**{'...' if len(declining) > 3 else ''}. These jurisdictions scored better earlier in the period.")
-    return " ".join(lines) if lines else "Accuracy trends look stable across the selected period."
+            diff = round(sub.iloc[-1] - sub.iloc[0], 1)
+            declining.append(f"{ind} ({diff:+.1f}%)")
+
+    lines = [f"**Period:** {period_label}  |  **Jurisdictions shown:** {df_w['Industry'].nunique()}"]
+
+    if len(acc3) > 0:
+        lines.append(f"**Score 3 avg accuracy (period mean):** {round(acc3.mean(), 1)}%")
+
+        if len(below3) > 0:
+            below_list = ", ".join(f"{jx} ({v}%)" for jx, v in below3.head(5).items())
+            lines.append(
+                f"**{len(below3)} jurisdiction(s) averaged below {BENCHMARK_3S}% on Score 3:** {below_list}"
+                + (" ..." if len(below3) > 5 else ".")
+            )
+        else:
+            lines.append(f"**All selected jurisdictions** averaged at or above the {BENCHMARK_3S}% Score 3 benchmark.")
+
+        if declining:
+            lines.append(
+                f"**Declining Score 3 trend (week-on-week):** {', '.join(declining[:5])}"
+                + (" ..." if len(declining) > 5 else ".")
+            )
+        else:
+            lines.append("**No declining Score 3 trends** detected across the selected period.")
+
+    if len(acc1) > 0:
+        lines.append(f"**Score 1 avg accuracy (period mean):** {round(acc1.mean(), 1)}%")
+
+    return "  \n".join(lines)
 
 def generate_sources_summary(df_top, period_label):
-    """Generate a plain-English summary of the top inaccurate sources."""
+    """Data-only sources summary — exact counts and figures only."""
     if df_top.empty:
         return "No qualifying sources found."
-    total = len(df_top)
-    below = len(df_top[df_top["Overall Agreement %"].notna() & (df_top["Overall Agreement %"] < BENCHMARK_3S)])
-    avg = round(df_top["Overall Agreement %"].dropna().mean(), 1)
-    worst = df_top.head(3)["Document / Source"].tolist()
+
+    total    = len(df_top)
+    below    = df_top[df_top["Overall Agreement %"].notna() & (df_top["Overall Agreement %"] < BENCHMARK_3S)]
+    above    = df_top[df_top["Overall Agreement %"].notna() & (df_top["Overall Agreement %"] >= BENCHMARK_3S)]
+    avg      = round(df_top["Overall Agreement %"].dropna().mean(), 1)
+    worst_3  = df_top.head(3)[["Document / Source", "Jurisdiction", "Overall Agreement %"]].copy()
+
     lines = [
-        f"Across the last 6 months, **{total} Tier 1 sources** had enough analyst-reviewed records to be assessed.",
-        f"**{below} of those ({round(below/total*100)}%)** are below the 80% agreement threshold — meaning analysts disagreed with the AI on more than 1 in 5 updates.",
-        f"Average analyst agreement across all reviewed Tier 1 sources is **{avg}%**.",
-        f"The most problematic sources right now are: **{', '.join(worst)}**.",
+        f"**Period:** {period_label}  |  **Tier 1 sources assessed:** {total} (min. 5 analyst-reviewed records each)",
+        f"**Average overall agreement:** {avg}%",
+        f"**Below 80% agreement:** {len(below)} source(s) ({round(len(below)/total*100, 1)}%)",
+        f"**At or above 80% agreement:** {len(above)} source(s) ({round(len(above)/total*100, 1)}%)",
     ]
-    return " ".join(lines)
+
+    if not worst_3.empty:
+        worst_list = "  \n".join(
+            f"- {row['Document / Source']} — {row['Jurisdiction']} ({row['Overall Agreement %']}%)"
+            for _, row in worst_3.iterrows()
+        )
+        lines.append(f"**3 lowest-agreement sources:**  \n{worst_list}")
+
+    return "  \n".join(lines)
 
 def compute_top_inaccurate_sources_6m(df):
     if df.empty:
         return pd.DataFrame()
+
     df = df.copy()
     df["ai_score"] = pd.to_numeric(df["ai_score"], errors="coerce")
     df["analyst_score"] = pd.to_numeric(df["analyst_score"], errors="coerce")
-    # Only analyst-changed records
+
+    # All analyst-reviewed records (agreed + changed)
     df = df[
         df["ai_score"].notna() &
-        df["analyst_score"].notna() &
-        (df["ai_score"] != df["analyst_score"])
+        df["analyst_score"].notna()
     ]
+
     # Only Tier 1 jurisdictions
     df = filter_tier1(df)
+
     rows = []
     for (doc, jx), grp in df.groupby(["document_name", "jurisdiction"], dropna=False):
         reviewed = int(grp["analyst_score"].notna().sum())
         if reviewed < 5:
             continue
-        total = len(grp)
-        s3 = int(len(grp[grp["ai_score"] == 3]))
-        s2 = int(len(grp[grp["ai_score"] == 2]))
-        s1 = int(len(grp[grp["ai_score"] == 1]))
-        unscored = int(grp["ai_score"].isna().sum())
-        agreed = int(len(grp[grp["ai_score"] == grp["analyst_score"]]))
+
+        total      = len(grp)
+        s3         = int(len(grp[grp["ai_score"] == 3]))
+        s2         = int(len(grp[grp["ai_score"] == 2]))
+        s1         = int(len(grp[grp["ai_score"] == 1]))
+        unscored   = int(grp["ai_score"].isna().sum())
+        agreed     = int(len(grp[grp["ai_score"] == grp["analyst_score"]]))
         accepted_3 = int(len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)]))
         accepted_1 = int(len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)]))
-        vertical = grp["vertical"].mode()[0] if "vertical" in grp.columns and grp["vertical"].notna().any() else None
+        vertical   = grp["vertical"].mode()[0] if "vertical" in grp.columns and grp["vertical"].notna().any() else None
+
         rows.append({
-            "Document / Source": doc,
-            "Jurisdiction": jx,
-            "Vertical": vertical,
-            "Total Disagreements": total,
-            "Analyst Reviewed": reviewed,
-            "AI Score 3 → Changed": s3,
-            "AI Score 2 → Changed": s2,
-            "AI Score 1 → Changed": s1,
-            "Overall Agreement %": round(agreed / reviewed * 100, 1) if reviewed > 0 else None,
-            "Accuracy 3s %": round(accepted_3 / s3 * 100, 1) if s3 > 0 else None,
-            "Accuracy 1s %": round((s1 - accepted_1) / s1 * 100, 1) if s1 > 0 else None,
+            "Document / Source":     doc,
+            "Jurisdiction":          jx,
+            "Vertical":              vertical,
+            "Analyst Reviewed":      reviewed,
+            "AI Score 3 Count":      s3,
+            "AI Score 2 Count":      s2,
+            "AI Score 1 Count":      s1,
+            "Overall Agreement %":   round(agreed / reviewed * 100, 1) if reviewed > 0 else None,
+            "Accuracy 3s %":         round(accepted_3 / s3 * 100, 1) if s3 > 0 else None,
+            "Accuracy 1s %":         round(accepted_1 / s1 * 100, 1) if s1 > 0 else None,
         })
+
     if not rows:
         return pd.DataFrame()
+
     return (
         pd.DataFrame(rows)
         .sort_values(["Overall Agreement %", "Analyst Reviewed"], ascending=[True, False], na_position="last")
@@ -269,7 +355,10 @@ def compute_top_inaccurate_sources_6m(df):
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("Model Accuracy Dashboard")
-st.caption("Showing **Tier 1 jurisdictions only** · Accuracy based on records where an analyst actively changed the AI score")
+st.caption(
+    "Showing **Tier 1 jurisdictions only** · "
+    "Accuracy = % of AI scores an analyst agreed with (no change made) out of all analyst-reviewed records"
+)
 
 # ── Period selector ───────────────────────────────────────────────────────────
 year_col, month_col, week_col, period_col = st.columns(4)
@@ -313,31 +402,39 @@ with period_col:
 try:
     with st.spinner("Loading data..."):
         df_feedback_raw = load_feedback_loop(year, month_str)
-        df_scored_raw = load_scored_updates(year, month_str)
+        df_scored_raw   = load_scored_updates(year, month_str)
 except Exception as e:
     st.error(f"Error loading data: {e}")
     st.stop()
 
 if week_option != "All weeks":
-    week_idx = weeks.index(week_option)
+    week_idx   = weeks.index(week_option)
     week_start = first_day + timedelta(weeks=week_idx)
-    week_end = min(week_start + timedelta(days=6), last_day)
+    week_end   = min(week_start + timedelta(days=6), last_day)
     df_feedback_raw = filter_by_week(df_feedback_raw, "score_updated_date", week_start, week_end)
-    df_scored_raw = filter_by_week(df_scored_raw, "processed_time", week_start, week_end)
+    df_scored_raw   = filter_by_week(df_scored_raw, "processed_time", week_start, week_end)
 
 # Apply Tier 1 filter
 df_feedback = filter_tier1(df_feedback_raw)
-df_scored = filter_tier1(df_scored_raw)
+df_scored   = filter_tier1(df_scored_raw)
 
-# Analyst-changed only (for accuracy calculations)
-df_feedback_changed = filter_analyst_changed(df_feedback)
+# All analyst-reviewed records (agreed + changed)
+df_feedback_reviewed = filter_analyst_reviewed(df_feedback)
+
+# Analyst-changed only — used for the Tab 4 "disagreements" view
+df_feedback_changed = df_feedback_reviewed[
+    df_feedback_reviewed["ai_score"] != df_feedback_reviewed["analyst_score"]
+]
 
 period_label = f"week of {week_option}" if week_option != "All weeks" else f"{month_name} {year}"
+
 st.caption(
     f"**{len(df_feedback):,}** Tier 1 feedback rows "
-    f"(**{len(df_feedback_changed):,}** analyst-changed) | "
+    f"(**{len(df_feedback_reviewed):,}** analyst-reviewed · "
+    f"**{len(df_feedback_changed):,}** analyst-changed) | "
     f"**{len(df_scored):,}** scored rows — {period_label}"
 )
+
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -354,16 +451,15 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.subheader("Model Accuracy Summary — Tier 1 Jurisdictions")
     st.caption(
-        "Only records where an analyst reviewed **and actively changed** the AI score are included. "
-        "Unscored updates and un-reviewed records are excluded from accuracy calculations."
+        "Accuracy = % of AI scores the analyst agreed with (left unchanged). "
+        "Includes all analyst-reviewed records. Unscored and un-reviewed records are excluded."
     )
 
-    if df_feedback_changed.empty:
-        st.warning("No analyst-changed records found for this period in Tier 1 jurisdictions.")
+    if df_feedback_reviewed.empty:
+        st.warning("No analyst-reviewed records found for this period in Tier 1 jurisdictions.")
     else:
-        summary = compute_summary(df_feedback_changed)
+        summary = compute_summary(df_feedback_reviewed)
 
-        # ── AI-generated summary ──────────────────────────────────────────────
         with st.expander("Summary Insight", expanded=True):
             st.info(generate_summary_text(summary, period_label))
 
@@ -379,14 +475,13 @@ with tab1:
 
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown("##### Score Distribution by Industry")
-            st.caption("How many updates the analyst changed per score level, by jurisdiction.")
-            st.bar_chart(
-                summary.set_index("Industry")[["Score 3", "Score 2", "Score 1"]]
-            )
+            st.markdown("##### Score Distribution by Jurisdiction")
+            st.caption("Number of analyst-reviewed records per AI score, by jurisdiction.")
+            st.bar_chart(summary.set_index("Industry")[["Score 3", "Score 2", "Score 1"]])
+
         with col_b:
-            st.markdown("##### Accuracy % by Industry")
-            st.caption(f"Benchmarks: 3s = {BENCHMARK_3S}%, 1s = {BENCHMARK_1S}%")
+            st.markdown("##### Accuracy % by Jurisdiction")
+            st.caption(f"Benchmarks: Score 3 = {BENCHMARK_3S}%, Score 1 = {BENCHMARK_1S}%")
             acc = (
                 summary.set_index("Industry")[["Accuracy 3s %", "Accuracy 1s %"]]
                 .dropna(how="all")
@@ -394,8 +489,9 @@ with tab1:
             st.bar_chart(acc)
 
         st.divider()
+
         st.markdown("##### Pending Analyst Review")
-        st.caption("Tier 1 updates scored 2 or 3 that haven't been reviewed yet.")
+        st.caption("Tier 1 updates the AI scored 2 or 3 that haven't been reviewed yet.")
         st.bar_chart(summary.set_index("Industry")[["Pending Review"]])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -403,29 +499,33 @@ with tab1:
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.subheader("Weekly Accuracy Trend — Tier 1 Jurisdictions")
-    st.caption("Week-by-week accuracy based on analyst-changed records only.")
+    st.caption(
+        "Week-by-week accuracy based on all analyst-reviewed records (agreed + changed). "
+        "Accuracy = % of AI scores the analyst left unchanged."
+    )
 
-    if df_feedback_changed.empty:
-        st.warning("No analyst-changed records found for this period.")
+    if df_feedback_reviewed.empty:
+        st.warning("No analyst-reviewed records found for this period.")
     else:
-        df_feedback_changed["week"] = (
-            pd.to_datetime(df_feedback_changed["score_updated_date"], errors="coerce")
+        df_feedback_reviewed = df_feedback_reviewed.copy()
+        df_feedback_reviewed["week"] = (
+            pd.to_datetime(df_feedback_reviewed["score_updated_date"], errors="coerce")
             .dt.tz_localize(None)
             .dt.to_period("W")
             .astype(str)
         )
 
         weekly = []
-        for (week, ind), grp in df_feedback_changed.groupby(["week", "jurisdiction"]):
+        for (week, ind), grp in df_feedback_reviewed.groupby(["week", "jurisdiction"]):
             t3 = len(grp[grp["ai_score"] == 3])
             t1 = len(grp[grp["ai_score"] == 1])
             a3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
             a1 = len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)])
             weekly.append({
-                "Week": week,
-                "Industry": ind,
-                "Accuracy 3s %": round(a3 / t3 * 100, 1) if t3 > 0 else None,
-                "Accuracy 1s %": round((t1 - a1) / t1 * 100, 1) if t1 > 0 else None,
+                "Week":           week,
+                "Industry":       ind,
+                "Accuracy 3s %":  round(a3 / t3 * 100, 1) if t3 > 0 else None,
+                "Accuracy 1s %":  round(a1 / t1 * 100, 1) if t1 > 0 else None,
             })
 
         df_w = pd.DataFrame(weekly)
@@ -437,7 +537,6 @@ with tab2:
             sel = st.multiselect("Filter by jurisdiction", industries, default=industries[:6])
             df_w_filtered = df_w[df_w["Industry"].isin(sel)]
 
-            # ── AI-generated summary ──────────────────────────────────────────
             with st.expander("Trend Insight", expanded=True):
                 st.info(generate_trend_summary(df_w_filtered, period_label))
 
@@ -447,6 +546,7 @@ with tab2:
                 p3 = df_w_filtered.pivot(index="Week", columns="Industry", values="Accuracy 3s %")
                 p3["-- Benchmark"] = BENCHMARK_3S
                 st.line_chart(p3)
+
             with col_b:
                 st.markdown("##### Score 1 Accuracy % per Week")
                 p1 = df_w_filtered.pivot(index="Week", columns="Industry", values="Accuracy 1s %")
@@ -471,23 +571,25 @@ with tab3:
             st.markdown("##### Confidence Score Distribution")
             st.bar_chart(df_scored["confidence_score"].value_counts().sort_index())
 
-        # Quick summary
         score_counts = df_scored["score"].value_counts().sort_index()
         total_sc = len(df_scored)
         pct3 = round(score_counts.get(3, 0) / total_sc * 100, 1) if total_sc > 0 else 0
+        pct2 = round(score_counts.get(2, 0) / total_sc * 100, 1) if total_sc > 0 else 0
         pct1 = round(score_counts.get(1, 0) / total_sc * 100, 1) if total_sc > 0 else 0
+
         with st.expander("Score Distribution Insight", expanded=True):
             st.info(
-                f"The model processed **{total_sc:,} updates** from Tier 1 jurisdictions this period. "
-                f"**{pct3}%** were rated high relevance (Score 3) and **{pct1}%** were rated low relevance (Score 1). "
-                f"A high proportion of Score 3s means the model is flagging a lot as important — cross-reference with the accuracy tab to check if analysts agree."
+                f"**Total updates processed:** {total_sc:,}  \n"
+                f"**Score 3 (high relevance):** {score_counts.get(3, 0):,} ({pct3}%)  \n"
+                f"**Score 2 (medium relevance):** {score_counts.get(2, 0):,} ({pct2}%)  \n"
+                f"**Score 1 (low relevance):** {score_counts.get(1, 0):,} ({pct1}%)"
             )
 
         st.divider()
 
-        t1_jx = ["All"] + sorted(df_scored["jurisdiction"].dropna().unique())
+        t1_jx   = ["All"] + sorted(df_scored["jurisdiction"].dropna().unique())
         sel_ind = st.selectbox("Filter by Jurisdiction", t1_jx)
-        view = df_scored if sel_ind == "All" else df_scored[df_scored["jurisdiction"] == sel_ind]
+        view    = df_scored if sel_ind == "All" else df_scored[df_scored["jurisdiction"] == sel_ind]
 
         st.markdown(f"##### Raw Records ({len(view):,} updates)")
         st.dataframe(
@@ -505,8 +607,8 @@ with tab3:
 with tab4:
     st.subheader("Top Inaccurate Sources — Tier 1, Last 6 Months")
     st.caption(
-        "Tier 1 jurisdictions only. Only records where an analyst **actively changed** the AI score are counted. "
-        "Sources with fewer than 5 such records are excluded."
+        "Tier 1 jurisdictions only. Includes all analyst-reviewed records (agreed + changed). "
+        "Sources with fewer than 5 reviewed records are excluded."
     )
 
     if st.button("Load 6-Month Data", type="primary"):
@@ -520,11 +622,14 @@ with tab4:
         if df_6m.empty:
             st.warning("No data returned for the last 6 months.")
         else:
-            t1_count = filter_tier1(df_6m)
-            changed_count = filter_analyst_changed(t1_count)
+            t1_count      = filter_tier1(df_6m)
+            reviewed_count = filter_analyst_reviewed(t1_count)
+            changed_count  = reviewed_count[reviewed_count["ai_score"] != reviewed_count["analyst_score"]]
+
             st.caption(
                 f"**{len(df_6m):,}** total records loaded · "
                 f"**{len(t1_count):,}** in Tier 1 jurisdictions · "
+                f"**{len(reviewed_count):,}** analyst-reviewed · "
                 f"**{len(changed_count):,}** analyst-changed"
             )
 
@@ -532,19 +637,20 @@ with tab4:
                 df_top = compute_top_inaccurate_sources_6m(df_6m)
 
             if df_top.empty:
-                st.info("No Tier 1 sources met the minimum threshold (5+ analyst-changed records).")
+                st.info("No Tier 1 sources met the minimum threshold (5+ analyst-reviewed records).")
             else:
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Tier 1 Sources Analysed", len(df_top))
+
                 below = len(df_top[
                     df_top["Overall Agreement %"].notna() &
                     (df_top["Overall Agreement %"] < BENCHMARK_3S)
                 ])
                 col2.metric("Sources Below 80% Agreement", below)
+
                 avg = round(df_top["Overall Agreement %"].dropna().mean(), 1)
                 col3.metric("Avg Overall Agreement %", f"{avg}%")
 
-                # ── AI-generated summary ──────────────────────────────────────
                 with st.expander("Sources Insight", expanded=True):
                     st.info(generate_sources_summary(df_top, "last 6 months"))
 
@@ -580,10 +686,10 @@ with tab4:
 
                 fmt = {
                     "Overall Agreement %": "{:.1f}%",
-                    "Accuracy 3s %": "{:.1f}%",
-                    "Accuracy 1s %": "{:.1f}%",
+                    "Accuracy 3s %":       "{:.1f}%",
+                    "Accuracy 1s %":       "{:.1f}%",
                 }
-                acc_cols = ["Overall Agreement %", "Accuracy 3s %", "Accuracy 1s %"]
+                acc_cols   = ["Overall Agreement %", "Accuracy 3s %", "Accuracy 1s %"]
                 styled_top = df_display.style.format(fmt, na_rep="-")
                 for col in acc_cols:
                     styled_top = styled_top.map(colour_score, subset=[col])
@@ -600,5 +706,6 @@ with tab4:
                 )
                 st.markdown("##### Overall Agreement % — Worst Sources")
                 st.bar_chart(chart_df)
+
     else:
         st.info("Click **Load 6-Month Data** above to run this analysis. It queries Athena and may take 20-40 seconds.")
