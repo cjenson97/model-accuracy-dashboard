@@ -85,6 +85,7 @@ def load_feedback_loop_6m():
         WHERE {conditions}
     """).as_pandas()
 
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def filter_by_week(df, date_col, week_start, week_end):
     dates = pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None)
