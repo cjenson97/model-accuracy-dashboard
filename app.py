@@ -551,11 +551,12 @@ st.caption(
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Weekly Summary",
     "Accuracy Trends",
     "Scored Updates",
     "Top Inaccurate Sources (6M)",
+    "Unreviewed Updates",
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -878,3 +879,112 @@ with tab4:
 
     else:
         st.info("Click **Load 6-Month Data** above to run this analysis. It queries Athena and may take 20-40 seconds.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Unreviewed Updates
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.subheader("Unreviewed Updates — Tier 1 Jurisdictions")
+    st.caption(
+        "Updates the AI has scored but no analyst has yet reviewed. "
+        "Covers all AI scores (1, 2, and 3) for the selected period."
+    )
+
+    # Build unreviewed dataset: ai_score present, analyst_score absent
+    df_unreviewed = df_feedback.copy()
+    df_unreviewed["ai_score"] = pd.to_numeric(df_unreviewed["ai_score"], errors="coerce")
+    df_unreviewed["analyst_score"] = pd.to_numeric(df_unreviewed["analyst_score"], errors="coerce")
+    df_unreviewed = df_unreviewed[
+        df_unreviewed["ai_score"].notna() &
+        df_unreviewed["analyst_score"].isna()
+    ]
+
+    if df_unreviewed.empty:
+        st.success("No unreviewed updates found for this period in Tier 1 jurisdictions.")
+    else:
+        total_unrev = len(df_unreviewed)
+        unrev_3 = int((df_unreviewed["ai_score"] == 3).sum())
+        unrev_2 = int((df_unreviewed["ai_score"] == 2).sum())
+        unrev_1 = int((df_unreviewed["ai_score"] == 1).sum())
+
+        # ── Key metrics ──────────────────────────────────────────────────────
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Unreviewed", f"{total_unrev:,}")
+        m2.metric("Score 3 Unreviewed", f"{unrev_3:,}",
+                  help="High-relevance updates not yet checked by an analyst")
+        m3.metric("Score 2 Unreviewed", f"{unrev_2:,}",
+                  help="Medium-relevance updates not yet checked by an analyst")
+        m4.metric("Score 1 Unreviewed", f"{unrev_1:,}",
+                  help="Low-relevance updates not yet checked by an analyst")
+
+        st.divider()
+
+        # ── By jurisdiction breakdown ─────────────────────────────────────────
+        by_jx = (
+            df_unreviewed.groupby("jurisdiction")["ai_score"]
+            .value_counts()
+            .unstack(fill_value=0)
+            .rename(columns={3: "Score 3", 2: "Score 2", 1: "Score 1"})
+        )
+        for col in ["Score 3", "Score 2", "Score 1"]:
+            if col not in by_jx.columns:
+                by_jx[col] = 0
+        by_jx = by_jx[["Score 3", "Score 2", "Score 1"]]
+        by_jx["Total"] = by_jx.sum(axis=1)
+        by_jx = by_jx.sort_values("Total", ascending=False)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("##### Unreviewed by Jurisdiction")
+            st.caption("Sorted by total unreviewed count.")
+            st.bar_chart(by_jx[["Score 3", "Score 2", "Score 1"]])
+
+        with col_b:
+            st.markdown("##### Unreviewed Count Table")
+            st.dataframe(by_jx.reset_index().rename(columns={"jurisdiction": "Jurisdiction"}),
+                         use_container_width=True)
+
+        st.divider()
+
+        # ── Filters ───────────────────────────────────────────────────────────
+        st.markdown("##### Unreviewed Records")
+        fc1, fc2, fc3 = st.columns(3)
+
+        with fc1:
+            jx_opts = ["All"] + sorted(df_unreviewed["jurisdiction"].dropna().unique())
+            sel_jx = st.selectbox("Filter by Jurisdiction", jx_opts, key="unrev_jx")
+
+        with fc2:
+            score_opts = ["All", "3 — High", "2 — Medium", "1 — Low"]
+            sel_score = st.selectbox("Filter by AI Score", score_opts, key="unrev_score")
+
+        with fc3:
+            if "vertical" in df_unreviewed.columns:
+                vt_opts = ["All"] + sorted(df_unreviewed["vertical"].dropna().unique())
+                sel_vt = st.selectbox("Filter by Vertical", vt_opts, key="unrev_vt")
+            else:
+                sel_vt = "All"
+
+        view_unrev = df_unreviewed.copy()
+        if sel_jx != "All":
+            view_unrev = view_unrev[view_unrev["jurisdiction"] == sel_jx]
+        if sel_score != "All":
+            score_val = int(sel_score[0])
+            view_unrev = view_unrev[view_unrev["ai_score"] == score_val]
+        if sel_vt != "All" and "vertical" in view_unrev.columns:
+            view_unrev = view_unrev[view_unrev["vertical"] == sel_vt]
+
+        # Select relevant display columns (handle optional columns gracefully)
+        display_cols = [c for c in [
+            "document_name", "jurisdiction", "vertical",
+            "ai_score", "ai_score_reason",
+            "created_date", "score_updated_date",
+        ] if c in view_unrev.columns]
+
+        st.caption(f"Showing **{len(view_unrev):,}** unreviewed records")
+        st.dataframe(
+            view_unrev[display_cols]
+            .sort_values("score_updated_date", ascending=False)
+            .reset_index(drop=True),
+            use_container_width=True,
+        )
