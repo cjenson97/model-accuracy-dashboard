@@ -110,35 +110,143 @@ def filter_analyst_reviewed(df):
         df["analyst_score"].notna()
     ]
 
-def compute_summary(df):
+def compute_score3_downgrade_breakdown(df):
     results = []
-    for industry, grp in df.groupby("jurisdiction"):
-        total_3 = len(grp[grp["ai_score"] == 3])
-        total_2 = len(grp[grp["ai_score"] == 2])
-        total_1 = len(grp[grp["ai_score"] == 1])
-        unscored = len(grp[grp["ai_score"].isna()])
+    for jurisdiction, grp in df.groupby("jurisdiction"):
+        s3 = grp[grp["ai_score"] == 3]
+        total = len(s3)
+        if total == 0:
+            continue
+        agreed    = len(s3[s3["analyst_score"] == 3])
+        to_2      = len(s3[s3["analyst_score"] == 2])
+        to_1      = len(s3[s3["analyst_score"] == 1])
+        results.append({
+            "Jurisdiction":       jurisdiction,
+            "AI Score 3 Total":   total,
+            "Analyst Agreed (→3)": agreed,
+            "Downgraded to 2":    to_2,
+            "Downgraded to 1":    to_1,
+            "% Agreed":           round(agreed / total * 100, 1),
+            "% → 2":              round(to_2   / total * 100, 1),
+            "% → 1":              round(to_1   / total * 100, 1),
+        })
+    return pd.DataFrame(results).sort_values("% Agreed") if results else pd.DataFrame()
 
-        # Accepted = analyst agreed with the AI score (no change made)
-        accepted_3 = len(grp[(grp["ai_score"] == 3) & (grp["analyst_score"] == 3)])
-        accepted_1 = len(grp[(grp["ai_score"] == 1) & (grp["analyst_score"] == 1)])
 
-        # Accuracy = how often the AI was correct (analyst agreed / total reviewed for that score)
+def generate_interpretation(summary_df, downgrade_df, period_label):
+    if summary_df.empty:
+        return "No data available for interpretation."
+
+    lines = [f"### Interpretation — {period_label}"]
+
+    acc3 = summary_df["Accuracy 3s %"].dropna()
+    avg3 = round(acc3.mean(), 1) if len(acc3) > 0 else None
+    below_benchmark = summary_df[summary_df["Accuracy 3s %"].notna() & (summary_df["Accuracy 3s %"] < BENCHMARK_3S)]
+    pct_below = round(len(below_benchmark) / len(acc3) * 100) if len(acc3) > 0 else 0
+
+    if avg3 is not None:
+        if avg3 < 50:
+            severity = "critical — the model is agreeing with analysts on fewer than half of its Score 3 decisions"
+        elif avg3 < BENCHMARK_3S:
+            severity = f"below target — the model needs improvement to reach the {BENCHMARK_3S}% benchmark"
+        else:
+            severity = "on target"
+        lines.append(f"**Overall Score 3 accuracy is {severity}.** Average across jurisdictions: {avg3}%.")
+
+    if pct_below > 75:
+        lines.append(
+            f"**{pct_below}% of jurisdictions are below the {BENCHMARK_3S}% benchmark.** "
+            "This is a systemic pattern, not isolated to one or two jurisdictions — the model is consistently over-scoring across the board."
+        )
+    elif pct_below > 40:
+        lines.append(
+            f"**{pct_below}% of jurisdictions are below benchmark.** "
+            "This is widespread but not universal, suggesting the model struggles in specific contexts rather than having a fundamental calibration problem."
+        )
+
+    if not downgrade_df.empty:
+        mostly_to_1 = downgrade_df[downgrade_df["% → 1"] > downgrade_df["% → 2"]]
+        mostly_to_2 = downgrade_df[downgrade_df["% → 2"] >= downgrade_df["% → 1"]]
+
+        if len(mostly_to_1) > len(mostly_to_2):
+            lines.append(
+                "**Analysts are mostly downgrading Score 3s all the way to Score 1** (not 2). "
+                "This suggests the model is fundamentally misidentifying low-relevance content as highly relevant — "
+                "a calibration or training data issue rather than a borderline scoring problem."
+            )
+        elif len(mostly_to_2) > 0:
+            lines.append(
+                "**Analysts are mostly downgrading Score 3s to Score 2** (not Score 1). "
+                "This suggests borderline cases where the model is slightly over-scoring rather than making large errors — "
+                "a threshold adjustment may be more appropriate than retraining."
+            )
+
+    above_benchmark = summary_df[summary_df["Accuracy 3s %"].notna() & (summary_df["Accuracy 3s %"] >= BENCHMARK_3S)]
+    if not above_benchmark.empty:
+        good = ", ".join(above_benchmark.sort_values("Accuracy 3s %", ascending=False)["Industry"].tolist())
+        lines.append(
+            f"**Jurisdictions meeting benchmark:** {good}. "
+            "The model performs well here — reviewing what these jurisdictions have in common (data volume, document types, vertical) "
+            "may reveal what conditions favour better model performance."
+        )
+
+    lines.append(
+        "**Recommended next steps:** (1) Check if analyst scoring guidelines have changed recently. "
+        "(2) Review the downgrade breakdown below to see if the pattern is consistent across jurisdictions. "
+        "(3) Use the Accuracy Trends tab to check whether this is getting better or worse over time."
+    )
+
+    return "  \n\n".join(lines)
+
+
+def compute_summary(df_all, df_reviewed):
+    """
+    df_all     — all Tier 1 feedback records (includes unreviewed)
+    df_reviewed — only analyst-reviewed records (both ai_score and analyst_score present)
+
+    Accuracy = accepted / total_all (not just reviewed) so unreviewed records
+    reduce the accuracy figure rather than being excluded from it.
+    """
+    df_all = df_all.copy()
+    df_all["ai_score"] = pd.to_numeric(df_all["ai_score"], errors="coerce")
+    df_all["analyst_score"] = pd.to_numeric(df_all["analyst_score"], errors="coerce")
+
+    results = []
+    for industry, grp_all in df_all.groupby("jurisdiction"):
+        grp_rev = df_reviewed[df_reviewed["jurisdiction"] == industry]
+
+        total_3  = len(grp_all[grp_all["ai_score"] == 3])
+        total_2  = len(grp_all[grp_all["ai_score"] == 2])
+        total_1  = len(grp_all[grp_all["ai_score"] == 1])
+        unscored = int(grp_all["ai_score"].isna().sum())
+
+        accepted_3 = len(grp_rev[(grp_rev["ai_score"] == 3) & (grp_rev["analyst_score"] == 3)])
+        accepted_2 = len(grp_rev[(grp_rev["ai_score"] == 2) & (grp_rev["analyst_score"] == 2)])
+        accepted_1 = len(grp_rev[(grp_rev["ai_score"] == 1) & (grp_rev["analyst_score"] == 1)])
+
+        # Denominator = ALL records for that score (including unreviewed)
         acc_3 = round(accepted_3 / total_3 * 100, 1) if total_3 > 0 else None
+        acc_2 = round(accepted_2 / total_2 * 100, 1) if total_2 > 0 else None
         acc_1 = round(accepted_1 / total_1 * 100, 1) if total_1 > 0 else None
 
-        pending = len(grp[(grp["ai_score"].isin([2, 3])) & (grp["analyst_score"].isna())])
+        pending = len(grp_all[
+            (grp_all["ai_score"].isin([2, 3])) &
+            (grp_all["analyst_score"].isna())
+        ])
 
         results.append({
-            "Industry": industry,
-            "Score 3": total_3,
-            "Score 2": total_2,
-            "Score 1": total_1,
-            "Unscored": unscored,
-            "3s Accepted": accepted_3,
-            "1s Accepted": accepted_1,
-            "Accuracy 3s %": acc_3,
-            "Accuracy 1s %": acc_1,
-            "Pending Review": pending,
+            "Industry":        industry,
+            "Score 3":         total_3,
+            "Score 2":         total_2,
+            "Score 1":         total_1,
+            "Unscored":        unscored,
+            "3s Accepted":     accepted_3,
+            "2s Accepted":     accepted_2,
+            "1s Accepted":     accepted_1,
+            "Accuracy 3s %":   acc_3,
+            "Accuracy 2s %":   acc_2,
+            "Accuracy 1s %":   acc_1,
+            "Pending Review":  pending,
         })
     return pd.DataFrame(results)
 
@@ -176,10 +284,15 @@ def generate_summary_text(summary_df, period_label):
         (summary_df["Accuracy 1s %"] < BENCHMARK_1S)
     ].sort_values("Accuracy 1s %")
 
-    total_reviewed = int(summary_df[["Score 3", "Score 2", "Score 1"]].sum().sum())
+    total_all     = int(summary_df[["Score 3", "Score 2", "Score 1"]].sum().sum())
+    total_accepted = int(summary_df[["3s Accepted", "2s Accepted", "1s Accepted"]].sum().sum())
     total_pending  = int(summary_df["Pending Review"].sum())
 
-    lines = [f"**Period:** {period_label}  |  **Total analyst-reviewed records:** {total_reviewed:,}"]
+    lines = [
+        f"**Period:** {period_label}  |  "
+        f"**Total scored records:** {total_all:,}  |  "
+        f"**Analyst accepted:** {total_accepted:,}"
+    ]
 
     if avg3 is not None:
         status3 = "✅ above" if avg3 >= BENCHMARK_3S else "🔴 below"
@@ -458,7 +571,7 @@ with tab1:
     if df_feedback_reviewed.empty:
         st.warning("No analyst-reviewed records found for this period in Tier 1 jurisdictions.")
     else:
-        summary = compute_summary(df_feedback_reviewed)
+        summary = compute_summary(df_feedback, df_feedback_reviewed)
 
         with st.expander("Summary Insight", expanded=True):
             st.info(generate_summary_text(summary, period_label))
@@ -467,7 +580,12 @@ with tab1:
             summary.style
             .map(lambda v: colour_cell(v, BENCHMARK_3S), subset=["Accuracy 3s %"])
             .map(lambda v: colour_cell(v, BENCHMARK_1S), subset=["Accuracy 1s %"])
-            .format({"Accuracy 3s %": "{:.1f}%", "Accuracy 1s %": "{:.1f}%"}, na_rep="-")
+            .map(colour_score, subset=["Accuracy 2s %"])
+            .format({
+                "Accuracy 3s %": "{:.1f}%",
+                "Accuracy 2s %": "{:.1f}%",
+                "Accuracy 1s %": "{:.1f}%",
+            }, na_rep="-")
         )
         st.dataframe(styled, use_container_width=True)
 
@@ -481,9 +599,9 @@ with tab1:
 
         with col_b:
             st.markdown("##### Accuracy % by Jurisdiction")
-            st.caption(f"Benchmarks: Score 3 = {BENCHMARK_3S}%, Score 1 = {BENCHMARK_1S}%")
+            st.caption(f"Benchmarks: Score 3 = {BENCHMARK_3S}%, Score 1 = {BENCHMARK_1S}%. Denominator = all records (including unreviewed).")
             acc = (
-                summary.set_index("Industry")[["Accuracy 3s %", "Accuracy 1s %"]]
+                summary.set_index("Industry")[["Accuracy 3s %", "Accuracy 2s %", "Accuracy 1s %"]]
                 .dropna(how="all")
             )
             st.bar_chart(acc)
@@ -493,6 +611,57 @@ with tab1:
         st.markdown("##### Pending Analyst Review")
         st.caption("Tier 1 updates the AI scored 2 or 3 that haven't been reviewed yet.")
         st.bar_chart(summary.set_index("Industry")[["Pending Review"]])
+
+        st.divider()
+
+        # ── Score 3 Downgrade Breakdown ──────────────────────────────────────
+        st.markdown("##### Score 3 Downgrade Breakdown")
+        st.caption(
+            "For every AI Score 3 record reviewed by an analyst: did they agree (→3), "
+            "downgrade slightly (→2), or downgrade fully (→1)? "
+            "This helps identify whether the model is slightly over-scoring or fundamentally miscalibrated."
+        )
+
+        downgrade_df = compute_score3_downgrade_breakdown(df_feedback_reviewed)
+
+        if downgrade_df.empty:
+            st.info("No Score 3 records with analyst reviews found for this period.")
+        else:
+            fmt_dg = {
+                "% Agreed": "{:.1f}%",
+                "% → 2":    "{:.1f}%",
+                "% → 1":    "{:.1f}%",
+            }
+
+            def colour_agreed(val):
+                if pd.isna(val):
+                    return ""
+                if val >= BENCHMARK_3S:
+                    return "color: green; font-weight: bold"
+                if val >= 50:
+                    return "color: orange; font-weight: bold"
+                return "color: red; font-weight: bold"
+
+            styled_dg = (
+                downgrade_df.style
+                .map(colour_agreed, subset=["% Agreed"])
+                .format(fmt_dg, na_rep="-")
+            )
+            st.dataframe(styled_dg, use_container_width=True)
+
+            st.markdown("###### Where are Score 3s going?")
+            chart_dg = (
+                downgrade_df.set_index("Jurisdiction")[["% Agreed", "% → 2", "% → 1"]]
+                .sort_values("% Agreed")
+            )
+            st.bar_chart(chart_dg)
+
+        st.divider()
+
+        # ── Interpretation ───────────────────────────────────────────────────
+        with st.expander("Diagnostic Interpretation", expanded=True):
+            interp = generate_interpretation(summary, downgrade_df if not downgrade_df.empty else pd.DataFrame(), period_label)
+            st.warning(interp)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — Weekly Accuracy Trend
