@@ -43,7 +43,7 @@ def load_feedback_loop(year: str, month: str):
             document_name, jurisdiction, vertical,
             ai_score, ai_score_reason,
             analyst_score, analyst_score_reason,
-            status, status_id
+            status, status_id, score_overridden
         FROM scans.feedback_loop_prod
         WHERE year = '{year}' AND month = '{month}'
     """).as_pandas()
@@ -891,14 +891,24 @@ with tab5:
         "Covers all AI scores (1, 2, and 3) for the selected period."
     )
 
-    # Build unreviewed dataset: ai_score present, analyst_score absent
+    # Build unreviewed dataset:
+    # Status = 'N/A' means the analyst has not acted on this update
+    # score_overridden = '0' means the analyst has not changed the AI score
     df_unreviewed = df_feedback.copy()
     df_unreviewed["ai_score"] = pd.to_numeric(df_unreviewed["ai_score"], errors="coerce")
-    df_unreviewed["analyst_score"] = pd.to_numeric(df_unreviewed["analyst_score"], errors="coerce")
-    df_unreviewed = df_unreviewed[
-        df_unreviewed["ai_score"].notna() &
-        df_unreviewed["analyst_score"].isna()
-    ]
+
+    if "score_overridden" in df_unreviewed.columns and "status" in df_unreviewed.columns:
+        df_unreviewed = df_unreviewed[
+            (df_unreviewed["status"].astype(str).str.strip().str.upper() == "N/A") &
+            (df_unreviewed["score_overridden"].astype(str).str.strip() == "0")
+        ]
+    else:
+        # Fallback if columns not present
+        df_unreviewed["analyst_score"] = pd.to_numeric(df_unreviewed["analyst_score"], errors="coerce")
+        df_unreviewed = df_unreviewed[
+            df_unreviewed["ai_score"].notna() &
+            df_unreviewed["analyst_score"].isna()
+        ]
 
     if df_unreviewed.empty:
         st.success("No unreviewed updates found for this period in Tier 1 jurisdictions.")
